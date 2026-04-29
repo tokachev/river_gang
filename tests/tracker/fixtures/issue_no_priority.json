@@ -1,0 +1,14 @@
+{
+  "id": "issue-uuid-3",
+  "identifier": "RG-3",
+  "title": "Issue without priority",
+  "description": null,
+  "priority": null,
+  "state": {"name": "In Progress"},
+  "branchName": null,
+  "url": null,
+  "labels": {"nodes": []},
+  "inverseRelations": {"nodes": []},
+  "createdAt": "2026-04-05T12:00:00.000Z",
+  "updatedAt": "2026-04-05T12:30:00.000Z"
+}

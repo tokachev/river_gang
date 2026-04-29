@@ -1,0 +1,70 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "river-gang"
+version = "0.1.0"
+description = "Symphony Service Specification v1 implementation: poll Linear, claim issue, run Codex app-server, stream events."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "river-gang" }]
+dependencies = [
+    "httpx>=0.27",
+    "pyyaml>=6.0",
+    "python-liquid>=1.12",
+    "graphql-core>=3.2",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "watchfiles>=0.21",
+    "jinja2>=3.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "respx>=0.21",
+    "ruff>=0.5",
+    "mypy>=1.10",
+]
+
+[project.scripts]
+river-gang = "river_gang.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/river_gang"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-ra"
+markers = [
+    "conformance: SPED §17 conformance test (run via -m conformance)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "N", "SIM"]
+ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["B", "N"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+
+[[tool.mypy.overrides]]
+module = "yaml"
+ignore_missing_imports = true
+

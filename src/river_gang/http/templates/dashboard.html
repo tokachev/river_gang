@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>symphony — runtime dashboard</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+           max-width: 1100px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; }
+    h1   { margin-bottom: 0.25rem; }
+    .ts  { color: #666; font-size: 0.9rem; margin-bottom: 2rem; }
+    h2   { border-bottom: 1px solid #ddd; padding-bottom: 0.25rem; margin-top: 2rem; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.92rem; }
+    th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid #eee; }
+    th   { background: #fafafa; font-weight: 600; }
+    .empty { color: #888; font-style: italic; padding: 0.5rem 0; }
+    .totals { display: flex; gap: 1.5rem; flex-wrap: wrap; }
+    .totals dt { font-weight: 600; color: #555; }
+    .totals dd { margin: 0; font-size: 1.05rem; }
+    .totals .cell { min-width: 9rem; }
+    code { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 0.88rem; }
+  </style>
+</head>
+<body>
+  <h1>symphony</h1>
+  <div class="ts">generated_at = <code>{{ snapshot.generated_at.isoformat() }}</code></div>
+
+  <h2>Active sessions</h2>
+  {% if snapshot.running %}
+  <table>
+    <thead>
+      <tr>
+        <th>identifier</th>
+        <th>title</th>
+        <th>state</th>
+        <th>session_id</th>
+        <th>started_at</th>
+        <th>turn_count</th>
+        <th>last_codex_event</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in snapshot.running %}
+      <tr>
+        <td><code>{{ row.identifier }}</code></td>
+        <td>{{ row.title }}</td>
+        <td>{{ row.state }}</td>
+        <td><code>{{ row.session_id or '' }}</code></td>
+        <td><code>{{ row.started_at.isoformat() }}</code></td>
+        <td>{{ row.turn_count }}</td>
+        <td>{{ row.last_codex_event or '' }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty">No active sessions.</p>
+  {% endif %}
+
+  <h2>Retry queue</h2>
+  {% if snapshot.retrying %}
+  <table>
+    <thead>
+      <tr>
+        <th>issue_id</th>
+        <th>identifier</th>
+        <th>attempt</th>
+        <th>kind</th>
+        <th>fire_at</th>
+        <th>last_error</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in snapshot.retrying %}
+      <tr>
+        <td><code>{{ row.issue_id }}</code></td>
+        <td><code>{{ row.identifier or '' }}</code></td>
+        <td>{{ row.attempt }}</td>
+        <td>{{ row.kind }}</td>
+        <td><code>{{ row.fire_at.isoformat() }}</code></td>
+        <td>{{ row.last_error or '' }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty">Retry queue empty.</p>
+  {% endif %}
+
+  <h2>Token consumption</h2>
+  <dl class="totals">
+    <div class="cell">
+      <dt>input_tokens</dt>
+      <dd>{{ snapshot.codex_totals.input_tokens }}</dd>
+    </div>
+    <div class="cell">
+      <dt>output_tokens</dt>
+      <dd>{{ snapshot.codex_totals.output_tokens }}</dd>
+    </div>
+    <div class="cell">
+      <dt>total_tokens</dt>
+      <dd>{{ snapshot.codex_totals.total_tokens }}</dd>
+    </div>
+    <div class="cell">
+      <dt>seconds_running</dt>
+      <dd>{{ '%.1f'|format(snapshot.codex_totals.seconds_running) }}</dd>
+    </div>
+  </dl>
+
+  {% if snapshot.rate_limits %}
+  <h2>Rate limits</h2>
+  <dl class="totals">
+    <div class="cell">
+      <dt>limit</dt>
+      <dd>{{ snapshot.rate_limits.limit if snapshot.rate_limits.limit is not none else '—' }}</dd>
+    </div>
+    <div class="cell">
+      <dt>remaining</dt>
+      <dd>{{ snapshot.rate_limits.remaining if snapshot.rate_limits.remaining is not none else '—' }}</dd>
+    </div>
+    <div class="cell">
+      <dt>reset_at</dt>
+      <dd><code>{{ snapshot.rate_limits.reset_at or '—' }}</code></dd>
+    </div>
+  </dl>
+  {% endif %}
+
+  <h2>Counts</h2>
+  <dl class="totals">
+    <div class="cell"><dt>running</dt><dd>{{ snapshot.counts.running }}</dd></div>
+    <div class="cell"><dt>retrying</dt><dd>{{ snapshot.counts.retrying }}</dd></div>
+    <div class="cell"><dt>completed</dt><dd>{{ snapshot.counts.completed }}</dd></div>
+  </dl>
+</body>
+</html>

@@ -1,0 +1,20 @@
+{
+  "id": "issue-uuid-4",
+  "identifier": "RG-4",
+  "title": "Mixed-case labels",
+  "description": "Labels arrive with mixed case from Linear.",
+  "priority": 3,
+  "state": {"name": "Todo"},
+  "branchName": "rg-4-labels",
+  "url": "https://linear.app/river-gang/issue/RG-4",
+  "labels": {
+    "nodes": [
+      {"name": "Bug"},
+      {"name": "BACKEND"},
+      {"name": "good-first-issue"}
+    ]
+  },
+  "inverseRelations": {"nodes": []},
+  "createdAt": "2026-04-06T07:00:00.000Z",
+  "updatedAt": "2026-04-06T07:15:00.000Z"
+}

@@ -1,0 +1,14 @@
+{
+  "id": "issue-uuid-1",
+  "identifier": "RG-1",
+  "title": "Implement workflow loader",
+  "description": "Parse WORKFLOW.md front matter and body.",
+  "priority": 2,
+  "state": {"name": "Todo"},
+  "branchName": "rg-1-implement-workflow-loader",
+  "url": "https://linear.app/river-gang/issue/RG-1",
+  "labels": {"nodes": []},
+  "inverseRelations": {"nodes": []},
+  "createdAt": "2026-04-01T10:30:00.000Z",
+  "updatedAt": "2026-04-02T11:45:30.000Z"
+}

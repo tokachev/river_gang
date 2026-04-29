@@ -1,0 +1,41 @@
+{
+  "id": "issue-uuid-2",
+  "identifier": "RG-2",
+  "title": "Wire candidate fetch",
+  "description": null,
+  "priority": 1,
+  "state": {"name": "Todo"},
+  "branchName": null,
+  "url": null,
+  "labels": {"nodes": []},
+  "inverseRelations": {
+    "nodes": [
+      {
+        "type": "blocks",
+        "issue": {
+          "id": "blocker-uuid-1",
+          "identifier": "RG-99",
+          "state": {"name": "In Progress"}
+        }
+      },
+      {
+        "type": "blocks",
+        "issue": {
+          "id": "blocker-uuid-2",
+          "identifier": "RG-100",
+          "state": {"name": "Done"}
+        }
+      },
+      {
+        "type": "duplicate",
+        "issue": {
+          "id": "dupe-uuid",
+          "identifier": "RG-50",
+          "state": {"name": "Closed"}
+        }
+      }
+    ]
+  },
+  "createdAt": "2026-04-03T08:00:00.000Z",
+  "updatedAt": "2026-04-04T09:00:00.000Z"
+}
