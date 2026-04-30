@@ -87,7 +87,7 @@ async def start_server(
     )
     server = uvicorn.Server(config)
 
-    task = asyncio.create_task(server.serve(), name="river-gang-http")
+    task = asyncio.create_task(_serve(server), name="river-gang-http")
 
     deadline = asyncio.get_running_loop().time() + _STARTUP_TIMEOUT_S
     while not server.started:
@@ -107,6 +107,23 @@ async def start_server(
 
     bound_port = _read_bound_port(server, fallback=port)
     return ServerHandle(port=bound_port, task=task, server=server)
+
+
+async def _serve(server: uvicorn.Server) -> None:
+    """Wrap ``server.serve()`` so SystemExit (raised by uvicorn on bind
+    failure) is converted into a regular exception inside the task.
+
+    asyncio does not store ``BaseException`` subclasses on the task and
+    instead re-raises them through the event loop, bypassing ``await
+    task``. Catching here keeps the failure inside task state where the
+    polling loop can surface it.
+    """
+    try:
+        await server.serve()
+    except SystemExit as exc:
+        raise RuntimeError(
+            f"uvicorn serve exited with code {exc.code}"
+        ) from exc
 
 
 def _read_bound_port(server: uvicorn.Server, *, fallback: int) -> int:
