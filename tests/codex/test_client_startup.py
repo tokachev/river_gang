@@ -54,7 +54,9 @@ def _make_fake_for_handshake(
     """Returns a fake process scripted to satisfy a full 3-step handshake.
 
     Each request from the client is read out of ``written_frames`` and the
-    fake replies with id-correlated responses queued in advance.
+    fake replies with id-correlated responses queued in advance. Responses
+    follow the codex 0.125.0+ schema: ``thread/start`` wraps identity inside
+    ``result.thread`` and ``turn/start`` inside ``result.turn``.
     """
     fake = FakeCodexProcess()
     # Pre-queue responses by id (the client always uses 1, 2, 3 in order).
@@ -67,12 +69,12 @@ def _make_fake_for_handshake(
         {
             "jsonrpc": "2.0",
             "id": 2,
-            "result": {"threadId": thread_id},
+            "result": {"thread": {"id": thread_id}},
         },
         {
             "jsonrpc": "2.0",
             "id": 3,
-            "result": {"turnId": turn_id},
+            "result": {"turn": {"id": turn_id, "status": "inProgress"}},
         },
     )
     return fake
@@ -118,8 +120,12 @@ async def test_start_session_emits_three_jsonrpc_requests_in_order(
         read_timeout_ms=5000,
     )
 
-    methods = [f["method"] for f in fake.written_frames]
-    ids = [f["id"] for f in fake.written_frames]
+    # Codex 0.125.0+ requires an ``initialized`` notification between the
+    # initialize ack and any subsequent request — filter to id-bearing
+    # frames to assert request ordering.
+    requests = [f for f in fake.written_frames if "id" in f]
+    methods = [f["method"] for f in requests]
+    ids = [f["id"] for f in requests]
     assert methods == [
         METHOD_INITIALIZE,
         METHOD_THREAD_START,
@@ -140,31 +146,21 @@ async def test_start_session_thread_start_uses_workspace_cwd(tmp_path: Path) -> 
         read_timeout_ms=5000,
     )
 
-    thread_start = fake.written_frames[1]
+    thread_start = next(
+        f for f in fake.written_frames if f.get("method") == METHOD_THREAD_START
+    )
+    # Codex 0.125.0+ ThreadStartParams renamed ``sandboxPolicy`` to ``sandbox``.
     assert thread_start["params"]["cwd"] == str(tmp_path)
     assert thread_start["params"]["approvalPolicy"] == "never"
-    assert thread_start["params"]["sandboxPolicy"] == "workspace-write"
-
-
-async def test_start_session_thread_start_carries_issue_title(tmp_path: Path) -> None:
-    """SPED §10.2: include "<identifier>: <title>" when title supported."""
-    fake = _make_fake_for_handshake()
-    client = CodexClient(process=fake, codex_app_server_pid=1)
-    await client.start_session(
-        workspace=tmp_path,
-        prompt="P",
-        issue=_issue(identifier="RG-7", title="Wire up retries"),
-        approval_policy="never",
-        sandbox_policy="workspace-write",
-        read_timeout_ms=5000,
-    )
-
-    thread_start = fake.written_frames[1]
-    assert thread_start["params"]["title"] == "RG-7: Wire up retries"
+    assert thread_start["params"]["sandbox"] == "workspace-write"
 
 
 async def test_start_session_first_turn_carries_prompt(tmp_path: Path) -> None:
-    """SPED §10.2: first turn carries the rendered issue prompt body."""
+    """SPED §10.2: first turn carries the rendered issue prompt body.
+
+    Codex 0.125.0+ TurnStartParams takes ``input: UserInput[]`` (each
+    ``{type: "text", text}``) instead of legacy ``prompt: string``.
+    """
     fake = _make_fake_for_handshake(thread_id="th-1")
     client = CodexClient(process=fake, codex_app_server_pid=1)
     await client.start_session(
@@ -176,27 +172,18 @@ async def test_start_session_first_turn_carries_prompt(tmp_path: Path) -> None:
         read_timeout_ms=5000,
     )
 
-    turn_start = fake.written_frames[2]
+    turn_start = next(
+        f for f in fake.written_frames if f.get("method") == METHOD_TURN_START
+    )
     assert turn_start["params"]["threadId"] == "th-1"
-    assert turn_start["params"]["prompt"] == "The full rendered prompt body"
-    # Must NOT carry continuation-guidance fields on the first turn
+    assert turn_start["params"]["input"] == [
+        {"type": "text", "text": "The full rendered prompt body"}
+    ]
+    # Legacy field MUST NOT leak.
+    assert "prompt" not in turn_start["params"]
+    # Must NOT carry continuation-guidance fields on the first turn.
     assert "guidance" not in turn_start["params"]
     assert "continuation" not in turn_start["params"]
-
-
-async def test_start_session_first_turn_carries_issue_title(tmp_path: Path) -> None:
-    fake = _make_fake_for_handshake()
-    client = CodexClient(process=fake, codex_app_server_pid=1)
-    await client.start_session(
-        workspace=tmp_path,
-        prompt="P",
-        issue=_issue(identifier="RG-9", title="Add CLI"),
-        approval_policy="never",
-        sandbox_policy="workspace-write",
-        read_timeout_ms=5000,
-    )
-    turn_start = fake.written_frames[2]
-    assert turn_start["params"]["title"] == "RG-9: Add CLI"
 
 
 async def test_start_session_initialize_advertises_client_info(tmp_path: Path) -> None:
@@ -210,7 +197,9 @@ async def test_start_session_initialize_advertises_client_info(tmp_path: Path) -
         sandbox_policy="workspace-write",
         read_timeout_ms=5000,
     )
-    init_request = fake.written_frames[0]
+    init_request = next(
+        f for f in fake.written_frames if f.get("method") == METHOD_INITIALIZE
+    )
     info = init_request["params"]["clientInfo"]
     assert info["name"] == "river-gang"
     assert isinstance(info["version"], str)
@@ -233,6 +222,87 @@ async def test_start_session_request_payloads_are_json_serialisable(
     )
     for frame in fake.written_frames:
         assert json.loads(json.dumps(frame)) == frame
+
+
+# ---------------------------------------------------------------------------
+# Interleaved frames during handshake
+# ---------------------------------------------------------------------------
+
+
+async def test_start_session_tolerates_interleaved_notification_before_response(
+    tmp_path: Path,
+) -> None:
+    """Codex MAY emit a notification (e.g. thread/started) before the
+    matching response. The handshake must skip past it and still locate
+    the id-correlated response — naive read-one-frame logic would hand
+    the notification to ``parse_response`` which would raise."""
+    fake = FakeCodexProcess()
+    fake.queue(
+        # initialize ack preceded by an unrelated notification.
+        {"jsonrpc": "2.0", "method": "thread/started", "params": {"x": 1}},
+        {"jsonrpc": "2.0", "id": 1, "result": {}},
+        {"jsonrpc": "2.0", "id": 2, "result": {"thread": {"id": "th-A"}}},
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "result": {"turn": {"id": "tn-A", "status": "inProgress"}},
+        },
+    )
+    client = CodexClient(process=fake, codex_app_server_pid=1)
+    session = await client.start_session(
+        workspace=tmp_path,
+        prompt="P",
+        issue=_issue(),
+        approval_policy="never",
+        sandbox_policy="workspace-write",
+        read_timeout_ms=5000,
+    )
+    assert session.thread_id == "th-A"
+    assert session.first_turn_id == "tn-A"
+
+
+async def test_start_session_dispatches_server_request_during_handshake(
+    tmp_path: Path,
+) -> None:
+    """A server request preceding a handshake response must be dispatched
+    (with a JSON-RPC reply) and the handshake still complete — codex
+    waits on the dispatcher reply before sending the next response."""
+    fake = FakeCodexProcess()
+    fake.queue(
+        # Server request arrives before the initialize ack.
+        {
+            "jsonrpc": "2.0",
+            "id": 9999,
+            "method": "some/server/request",
+            "params": {"k": "v"},
+        },
+        {"jsonrpc": "2.0", "id": 1, "result": {}},
+        {"jsonrpc": "2.0", "id": 2, "result": {"thread": {"id": "th-B"}}},
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "result": {"turn": {"id": "tn-B", "status": "inProgress"}},
+        },
+    )
+    client = CodexClient(process=fake, codex_app_server_pid=1)
+    session = await client.start_session(
+        workspace=tmp_path,
+        prompt="P",
+        issue=_issue(),
+        approval_policy="never",
+        sandbox_policy="workspace-write",
+        read_timeout_ms=5000,
+    )
+    assert session.thread_id == "th-B"
+
+    # The dispatcher wrote a -32601 reply for the unregistered method.
+    replies = [
+        f
+        for f in fake.written_frames
+        if f.get("id") == 9999 and "method" not in f
+    ]
+    assert len(replies) == 1, fake.written_frames
+    assert replies[0]["error"]["code"] == -32601
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +481,85 @@ async def test_start_session_id_mismatch_in_response_raises(tmp_path: Path) -> N
 # ---------------------------------------------------------------------------
 # Session shape
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# initialized notification (codex 0.125.0+ ClientNotification schema)
+# ---------------------------------------------------------------------------
+
+
+async def test_start_session_emits_initialized_notification_after_initialize(
+    tmp_path: Path,
+) -> None:
+    """ClientNotification schema: client MUST send ``{method: "initialized"}``
+    after ``initialize`` ack, BEFORE any subsequent calls (thread/start etc.).
+    """
+    fake = FakeCodexProcess()
+    # New-shape responses (codex 0.125.0+): result wrapped in {thread:{id}}
+    # / {turn:{id, status}}.
+    fake.queue(
+        {"jsonrpc": "2.0", "id": 1, "result": {"capabilities": {}}},
+        {"jsonrpc": "2.0", "id": 2, "result": {"thread": {"id": "th-1"}}},
+        {"jsonrpc": "2.0", "id": 3, "result": {"turn": {"id": "tn-1"}}},
+    )
+    client = CodexClient(process=fake, codex_app_server_pid=1)
+    await client.start_session(
+        workspace=tmp_path,
+        prompt="P",
+        issue=_issue(),
+        approval_policy="never",
+        sandbox_policy="workspace-write",
+        read_timeout_ms=5000,
+    )
+
+    # Order of writes must be:
+    #   1. initialize request    (id=1, has method+id+params)
+    #   2. initialized           (notification, method only — no id)
+    #   3. thread/start request  (id=2)
+    #   4. turn/start request    (id=3)
+    methods = [f.get("method") for f in fake.written_frames]
+    assert methods[0] == "initialize"
+    assert methods[1] == "initialized"
+    assert methods[2] == "thread/start"
+    assert methods[3] == "turn/start"
+
+    initialized_frame = fake.written_frames[1]
+    # ClientNotification.InitializedNotification: method only — no id, no params.
+    assert "id" not in initialized_frame
+    assert initialized_frame == {"method": "initialized"}
+
+
+async def test_initialized_sent_before_thread_start_request(tmp_path: Path) -> None:
+    """``initialized`` MUST land on the wire before any non-initialize request
+    so codex sees the post-handshake signal before it processes thread/start.
+    """
+    fake = FakeCodexProcess()
+    fake.queue(
+        {"jsonrpc": "2.0", "id": 1, "result": {"capabilities": {}}},
+        {"jsonrpc": "2.0", "id": 2, "result": {"thread": {"id": "th-x"}}},
+        {"jsonrpc": "2.0", "id": 3, "result": {"turn": {"id": "tn-x"}}},
+    )
+    client = CodexClient(process=fake, codex_app_server_pid=1)
+    await client.start_session(
+        workspace=tmp_path,
+        prompt="P",
+        issue=_issue(),
+        approval_policy="never",
+        sandbox_policy="workspace-write",
+        read_timeout_ms=5000,
+    )
+
+    initialized_idx = next(
+        i
+        for i, f in enumerate(fake.written_frames)
+        if f.get("method") == "initialized"
+    )
+    thread_start_idx = next(
+        i
+        for i, f in enumerate(fake.written_frames)
+        if f.get("method") == "thread/start"
+    )
+    assert initialized_idx < thread_start_idx
 
 
 def test_session_dataclass_is_frozen() -> None:

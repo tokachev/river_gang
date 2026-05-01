@@ -9,7 +9,6 @@ import pytest
 
 from river_gang.codex.errors import ResponseError
 from river_gang.codex.protocol import (
-    JSONRPC_VERSION,
     METHOD_INITIALIZE,
     METHOD_THREAD_START,
     METHOD_TURN_START,
@@ -31,7 +30,7 @@ from river_gang.codex.protocol import (
 
 def test_build_initialize_request_envelope() -> None:
     req = build_initialize_request(id=1)
-    assert req["jsonrpc"] == JSONRPC_VERSION
+    assert "jsonrpc" not in req
     assert req["id"] == 1
     assert req["method"] == METHOD_INITIALIZE
     assert "params" in req
@@ -65,12 +64,14 @@ def test_build_thread_start_request_envelope() -> None:
         approval_policy="never",
         sandbox_policy="workspace-write",
     )
-    assert req["jsonrpc"] == JSONRPC_VERSION
+    assert "jsonrpc" not in req
     assert req["id"] == 2
     assert req["method"] == METHOD_THREAD_START
 
 
 def test_thread_start_carries_cwd_and_policies() -> None:
+    """Codex 0.125.0+ ThreadStartParams uses ``sandbox`` (SandboxMode), not
+    legacy ``sandboxPolicy``."""
     req = build_thread_start_request(
         id=2,
         cwd="/abs/path/ws",
@@ -80,27 +81,18 @@ def test_thread_start_carries_cwd_and_policies() -> None:
     params = req["params"]
     assert params["cwd"] == "/abs/path/ws"
     assert params["approvalPolicy"] == "never"
-    assert params["sandboxPolicy"] == "workspace-write"
+    assert params["sandbox"] == "workspace-write"
+    # Legacy field MUST NOT be sent — codex schema validation rejects it.
+    assert "sandboxPolicy" not in params
 
 
-def test_thread_start_includes_title_when_provided() -> None:
+def test_thread_start_omits_title() -> None:
+    """ThreadStartParams has no ``title`` field in the v2 schema."""
     req = build_thread_start_request(
         id=2,
         cwd="/abs",
         approval_policy="never",
         sandbox_policy="workspace-write",
-        title="RG-1: Implement feature",
-    )
-    assert req["params"]["title"] == "RG-1: Implement feature"
-
-
-def test_thread_start_omits_title_when_none() -> None:
-    req = build_thread_start_request(
-        id=2,
-        cwd="/abs",
-        approval_policy="never",
-        sandbox_policy="workspace-write",
-        title=None,
     )
     assert "title" not in req["params"]
 
@@ -112,31 +104,35 @@ def test_thread_start_omits_title_when_none() -> None:
 
 def test_build_turn_start_request_envelope() -> None:
     req = build_turn_start_request(id=3, thread_id="th-1", prompt="Do the thing")
-    assert req["jsonrpc"] == JSONRPC_VERSION
+    assert "jsonrpc" not in req
     assert req["id"] == 3
     assert req["method"] == METHOD_TURN_START
 
 
-def test_turn_start_carries_thread_id_and_prompt() -> None:
+def test_turn_start_carries_thread_id_and_input_array() -> None:
+    """Codex 0.125.0+ TurnStartParams takes ``input: UserInput[]``, not
+    ``prompt: string``. River-gang only sends text input."""
     req = build_turn_start_request(id=3, thread_id="th-1", prompt="Do the thing")
     params = req["params"]
     assert params["threadId"] == "th-1"
-    assert params["prompt"] == "Do the thing"
+    assert params["input"] == [{"type": "text", "text": "Do the thing"}]
+    # Legacy field must not leak.
+    assert "prompt" not in params
 
 
-def test_turn_start_includes_title_when_provided() -> None:
-    req = build_turn_start_request(
-        id=3, thread_id="th-1", prompt="P", title="RG-1: Title"
-    )
-    assert req["params"]["title"] == "RG-1: Title"
+def test_turn_start_omits_title() -> None:
+    """TurnStartParams has no ``title`` field in the v2 schema."""
+    req = build_turn_start_request(id=3, thread_id="th-1", prompt="P")
+    assert "title" not in req["params"]
 
 
 def test_turn_start_no_continuation_field_on_first_turn() -> None:
     req = build_turn_start_request(id=3, thread_id="th-1", prompt="P")
-    # First-turn request must carry the prompt body, NOT a continuation marker.
+    # First-turn request carries the prompt body in `input`, not a
+    # continuation marker.
     assert "continuation" not in req["params"]
     assert "guidance" not in req["params"]
-    assert req["params"]["prompt"] == "P"
+    assert req["params"]["input"] == [{"type": "text", "text": "P"}]
 
 
 # ---------------------------------------------------------------------------
@@ -153,14 +149,16 @@ def test_continuation_turn_request_envelope() -> None:
 
 
 def test_continuation_turn_omits_original_prompt() -> None:
-    """SPED §10.2: continuation turns send only continuation guidance —
-    they MUST NOT resend the original prompt that's already in thread history."""
+    """SPED §10.2: continuation turns send only continuation guidance in the
+    same ``input`` array shape as first turns. They MUST NOT resend the
+    original prompt that's already in thread history."""
     req = build_continuation_turn_request(
         id=4, thread_id="th-1", guidance="please continue"
     )
     params = req["params"]
     assert "prompt" not in params
-    assert params["guidance"] == "please continue"
+    assert "guidance" not in params  # legacy bespoke field, removed
+    assert params["input"] == [{"type": "text", "text": "please continue"}]
 
 
 # ---------------------------------------------------------------------------
@@ -197,10 +195,21 @@ def test_parse_response_id_mismatch_raises() -> None:
         parse_response(raw, expected_id=1)
 
 
-def test_parse_response_wrong_version_raises() -> None:
-    raw = {"jsonrpc": "1.0", "id": 1, "result": {}}
-    with pytest.raises(ResponseError):
-        parse_response(raw, expected_id=1)
+def test_parse_response_tolerates_missing_jsonrpc_field() -> None:
+    """Codex 0.125.0+ schema does not carry a ``jsonrpc`` envelope field —
+    parser must accept responses without it."""
+    raw = {"id": 1, "result": {}}
+    res = parse_response(raw, expected_id=1)
+    assert res.id == 1
+    assert res.result == {}
+
+
+def test_parse_response_tolerates_legacy_jsonrpc_field() -> None:
+    """If a future Codex version reintroduces the field, ignore it rather
+    than reject the response."""
+    raw = {"jsonrpc": "2.0", "id": 1, "result": {}}
+    res = parse_response(raw, expected_id=1)
+    assert res.id == 1
 
 
 def test_parse_response_neither_result_nor_error_raises() -> None:
@@ -227,37 +236,76 @@ def test_parse_response_notification_without_id_raises() -> None:
         parse_response(raw, expected_id=1)
 
 
+def test_parse_response_non_dict_result_raises() -> None:
+    """``result`` MUST be an object — strings/ints/null aren't valid."""
+    for bogus in ("not-a-dict", 42, None, [1, 2, 3]):
+        with pytest.raises(ResponseError, match="result"):
+            parse_response({"id": 1, "result": bogus}, expected_id=1)
+
+
+def test_parse_response_non_dict_error_raises() -> None:
+    """``error`` MUST be an object — strings/ints aren't valid."""
+    for bogus in ("oops", 42, [1, 2]):
+        with pytest.raises(ResponseError, match="error"):
+            parse_response({"id": 1, "error": bogus}, expected_id=1)
+
+
 # ---------------------------------------------------------------------------
 # Identity extraction
 # ---------------------------------------------------------------------------
 
 
 def test_extract_thread_id_from_result() -> None:
-    assert extract_thread_id({"threadId": "th-abc"}) == "th-abc"
+    """ThreadStartResponse wraps the id inside a ``thread`` object."""
+    assert extract_thread_id({"thread": {"id": "th-abc"}}) == "th-abc"
 
 
 def test_extract_turn_id_from_result() -> None:
-    assert extract_turn_id({"turnId": "tn-xyz"}) == "tn-xyz"
+    """TurnStartResponse wraps the id inside a ``turn`` object."""
+    assert extract_turn_id({"turn": {"id": "tn-xyz", "status": "inProgress"}}) == "tn-xyz"
 
 
-def test_extract_thread_id_missing_raises() -> None:
+def test_extract_thread_id_missing_thread_object_raises() -> None:
     with pytest.raises(ResponseError):
         extract_thread_id({})
 
 
-def test_extract_turn_id_missing_raises() -> None:
+def test_extract_thread_id_missing_id_inside_thread_raises() -> None:
+    with pytest.raises(ResponseError):
+        extract_thread_id({"thread": {}})
+
+
+def test_extract_turn_id_missing_turn_object_raises() -> None:
     with pytest.raises(ResponseError):
         extract_turn_id({})
 
 
+def test_extract_turn_id_missing_id_inside_turn_raises() -> None:
+    with pytest.raises(ResponseError):
+        extract_turn_id({"turn": {}})
+
+
 def test_extract_thread_id_non_string_raises() -> None:
     with pytest.raises(ResponseError):
-        extract_thread_id({"threadId": 123})
+        extract_thread_id({"thread": {"id": 123}})
 
 
 def test_extract_turn_id_non_string_raises() -> None:
     with pytest.raises(ResponseError):
-        extract_turn_id({"turnId": None})
+        extract_turn_id({"turn": {"id": None}})
+
+
+def test_extract_thread_id_rejects_legacy_top_level_field() -> None:
+    """Pre-0.125.0 servers sent ``result.threadId`` at top level. New schema
+    requires ``result.thread.id`` — extractor must not accidentally fall
+    back to the legacy field, which would mask a real schema mismatch."""
+    with pytest.raises(ResponseError):
+        extract_thread_id({"threadId": "th-legacy"})
+
+
+def test_extract_turn_id_rejects_legacy_top_level_field() -> None:
+    with pytest.raises(ResponseError):
+        extract_turn_id({"turnId": "tn-legacy"})
 
 
 def test_compose_session_id() -> None:

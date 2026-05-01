@@ -65,7 +65,3 @@ class TurnFailed(CodexError):  # noqa: N818 -- spec-defined name
 
 class TurnCancelled(CodexError):  # noqa: N818 -- spec-defined name
     """Turn was cancelled (operator-initiated or timeout-driven)."""
-
-
-class TurnInputRequired(CodexError):  # noqa: N818 -- spec-defined name
-    """Turn paused requesting additional operator input."""

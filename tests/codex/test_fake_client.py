@@ -12,7 +12,6 @@ from river_gang.codex.errors import (
     PortExit,
     TurnCancelled,
     TurnFailed,
-    TurnInputRequired,
     TurnTimeout,
 )
 from river_gang.tracker.issue import Issue
@@ -181,18 +180,6 @@ async def test_stream_turn_scenario_cancelled_raises_turn_cancelled() -> None:
     fake = FakeCodexClient()
     fake.queue_turn(TurnScenario(events=[], outcome="cancelled"))
     with pytest.raises(TurnCancelled):
-        await fake.stream_turn(
-            session=_session(),
-            prompt="x",
-            on_event=lambda _e: None,
-            turn_timeout_ms=5000,
-        )
-
-
-async def test_stream_turn_scenario_input_required_raises_turn_input_required() -> None:
-    fake = FakeCodexClient()
-    fake.queue_turn(TurnScenario(events=[], outcome="input_required"))
-    with pytest.raises(TurnInputRequired):
         await fake.stream_turn(
             session=_session(),
             prompt="x",

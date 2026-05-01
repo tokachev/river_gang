@@ -1,11 +1,13 @@
-"""Codex app-server JSON-RPC 2.0 message helpers (SPED §10.2, §17.5).
+"""Codex app-server message helpers (SPED §10.2, §17.5).
 
-The Codex app-server protocol is intentionally pinned to a JSON-RPC 2.0
-wire format here: id-correlated request/response objects on stdout/stdin,
-notifications (no ``id``) for streamed turn events. Spec §10.2 deliberately
-defers to "the targeted Codex app-server protocol"; we pick JSON-RPC 2.0
-because it matches the Codex app-server reference implementation and gives
-us cheap request/response correlation.
+Wire format follows the targeted Codex app-server schema: id-correlated
+request/response objects on stdout/stdin, notifications (no ``id``) for
+streamed turn events. SPED §10.2 explicitly defers to "the targeted Codex
+app-server protocol"; current codex (0.125.0+) ships its schema via
+``codex app-server generate-json-schema`` and does NOT carry a JSON-RPC
+``"jsonrpc": "2.0"`` envelope field — only ``id`` / ``method`` / ``result``
+/ ``error`` / ``params``. Earlier versions did carry it; we follow the
+current schema.
 
 Message construction is kept dict-based on purpose — the wire bytes go
 straight through :func:`json.dumps`, and the framing layer (Task 16) speaks
@@ -21,13 +23,11 @@ from typing import Any
 
 from river_gang.codex.errors import ResponseError
 
-JSONRPC_VERSION = "2.0"
-
 CLIENT_NAME = "river-gang"
 
 METHOD_INITIALIZE = "initialize"
-METHOD_THREAD_START = "thread.start"
-METHOD_TURN_START = "turn.start"
+METHOD_THREAD_START = "thread/start"
+METHOD_TURN_START = "turn/start"
 
 
 def _resolve_client_version() -> str:
@@ -61,16 +61,18 @@ class JsonRpcResponse:
 # ---------------------------------------------------------------------------
 
 
-def build_initialize_request(
-    *,
-    id: int,
-    tools: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
+def build_initialize_request(*, id: int) -> dict[str, Any]:
     """Build an ``initialize`` request.
 
-    When ``tools`` is supplied, it's included as ``params.tools`` so the
-    Codex app-server knows which client-side tools the orchestrator will
-    handle (SPED §10.5 client-side tool advertisement).
+    NOTE (codex 0.125.0+ schema gap): :file:`InitializeParams.json` and
+    :file:`ThreadStartParams.json` define no public field for advertising
+    client-side tools — :file:`DynamicToolSpec` is defined but unreferenced
+    on either request. River-gang implements the agent-side of
+    ``item/tool/call`` (SPED §10.5) but cannot advertise its
+    ``linear_graphql`` tool through the wire. Codex must be configured with
+    knowledge of the tool externally (e.g. via MCP server registration) for
+    it to send ``item/tool/call`` requests. TODO: revisit when codex exposes
+    a tool-advertisement field.
     """
     params: dict[str, Any] = {
         "clientInfo": {
@@ -78,10 +80,7 @@ def build_initialize_request(
             "version": _resolve_client_version(),
         },
     }
-    if tools is not None:
-        params["tools"] = tools
     return {
-        "jsonrpc": JSONRPC_VERSION,
         "id": id,
         "method": METHOD_INITIALIZE,
         "params": params,
@@ -94,17 +93,20 @@ def build_thread_start_request(
     cwd: str,
     approval_policy: str,
     sandbox_policy: str,
-    title: str | None = None,
 ) -> dict[str, Any]:
+    """Build a ``thread/start`` request.
+
+    The ``sandbox_policy`` keyword is rendered as JSON field ``sandbox`` —
+    Codex 0.125.0+ ThreadStartParams uses ``sandbox`` for the SandboxMode
+    enum (read-only / workspace-write / danger-full-access). The legacy
+    ``sandboxPolicy`` field on this request was renamed.
+    """
     params: dict[str, Any] = {
         "cwd": cwd,
         "approvalPolicy": approval_policy,
-        "sandboxPolicy": sandbox_policy,
+        "sandbox": sandbox_policy,
     }
-    if title is not None:
-        params["title"] = title
     return {
-        "jsonrpc": JSONRPC_VERSION,
         "id": id,
         "method": METHOD_THREAD_START,
         "params": params,
@@ -116,17 +118,18 @@ def build_turn_start_request(
     id: int,
     thread_id: str,
     prompt: str,
-    title: str | None = None,
 ) -> dict[str, Any]:
-    """First-turn request — carries the rendered issue prompt body."""
+    """First-turn request — carries the rendered issue prompt body.
+
+    Codex 0.125.0+ TurnStartParams takes ``input`` as an array of ``UserInput``
+    objects (each ``{"type": "text", "text": ...}``) instead of the legacy
+    ``prompt: string`` field.
+    """
     params: dict[str, Any] = {
         "threadId": thread_id,
-        "prompt": prompt,
+        "input": [{"type": "text", "text": prompt}],
     }
-    if title is not None:
-        params["title"] = title
     return {
-        "jsonrpc": JSONRPC_VERSION,
         "id": id,
         "method": METHOD_TURN_START,
         "params": params,
@@ -138,25 +141,16 @@ def build_continuation_turn_request(
     id: int,
     thread_id: str,
     guidance: str,
-    title: str | None = None,
 ) -> dict[str, Any]:
     """Continuation-turn request — carries only continuation guidance.
 
     SPED §10.2: continuation turns MUST NOT resend the original issue prompt
-    that's already in thread history.
+    that's already in thread history. Like the first turn, the continuation
+    body travels in the ``input`` array as a text UserInput — wire-shape is
+    identical to :func:`build_turn_start_request`; this wrapper exists for
+    call-site documentation only.
     """
-    params: dict[str, Any] = {
-        "threadId": thread_id,
-        "guidance": guidance,
-    }
-    if title is not None:
-        params["title"] = title
-    return {
-        "jsonrpc": JSONRPC_VERSION,
-        "id": id,
-        "method": METHOD_TURN_START,
-        "params": params,
-    }
+    return build_turn_start_request(id=id, thread_id=thread_id, prompt=guidance)
 
 
 # ---------------------------------------------------------------------------
@@ -165,18 +159,17 @@ def build_continuation_turn_request(
 
 
 def parse_response(raw: dict[str, Any], *, expected_id: int) -> JsonRpcResponse:
-    """Strict-shape JSON-RPC 2.0 response decoder.
+    """Strict-shape response decoder for the targeted Codex app-server.
+
+    The current Codex schema (codex 0.125.0+) does not carry a JSON-RPC
+    ``"jsonrpc": "2.0"`` envelope field — only ``id`` plus exactly one of
+    ``result`` / ``error``. We tolerate the field if a future Codex sends
+    it again, but never require it.
 
     Raises:
-        ResponseError: malformed envelope, version mismatch, id mismatch,
-            both ``result`` and ``error`` set, or neither set.
+        ResponseError: malformed envelope, id mismatch, both ``result`` and
+            ``error`` set, or neither set.
     """
-    version = raw.get("jsonrpc")
-    if version != JSONRPC_VERSION:
-        raise ResponseError(
-            f"unexpected jsonrpc version: {version!r}, want {JSONRPC_VERSION!r}"
-        )
-
     if "id" not in raw:
         raise ResponseError("response missing 'id' field (notification?)")
     response_id = raw["id"]
@@ -217,20 +210,38 @@ def parse_response(raw: dict[str, Any], *, expected_id: int) -> JsonRpcResponse:
 
 
 def extract_thread_id(result: dict[str, Any]) -> str:
-    """Pull ``threadId`` from a ``thread.start`` result. Raises on missing."""
-    value = result.get("threadId")
+    """Pull ``thread.id`` from a ``thread/start`` result. Raises on missing.
+
+    Codex 0.125.0+ ThreadStartResponse wraps identity in a ``thread`` object
+    (``{"thread": {"id": ..., ...}}``) instead of the legacy top-level
+    ``threadId`` field.
+    """
+    thread = result.get("thread")
+    if not isinstance(thread, dict):
+        raise ResponseError(
+            "thread/start result missing object 'thread'"
+        )
+    value = thread.get("id")
     if not isinstance(value, str) or value == "":
         raise ResponseError(
-            "thread.start result missing string 'threadId'"
+            "thread/start result missing string 'thread.id'"
         )
     return value
 
 
 def extract_turn_id(result: dict[str, Any]) -> str:
-    """Pull ``turnId`` from a ``turn.start`` result. Raises on missing."""
-    value = result.get("turnId")
+    """Pull ``turn.id`` from a ``turn/start`` result. Raises on missing.
+
+    Codex 0.125.0+ TurnStartResponse wraps identity in a ``turn`` object
+    (``{"turn": {"id": ..., ...}}``) instead of the legacy top-level
+    ``turnId`` field.
+    """
+    turn = result.get("turn")
+    if not isinstance(turn, dict):
+        raise ResponseError("turn/start result missing object 'turn'")
+    value = turn.get("id")
     if not isinstance(value, str) or value == "":
-        raise ResponseError("turn.start result missing string 'turnId'")
+        raise ResponseError("turn/start result missing string 'turn.id'")
     return value
 
 
