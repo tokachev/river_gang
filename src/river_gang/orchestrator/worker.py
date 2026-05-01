@@ -2,31 +2,47 @@
 
 A *worker attempt* is one end-to-end pass through the §16.5 flow for a
 single issue: render prompt → ensure workspace → ``before_run`` → start
-Codex session → stream turns until exit condition → cleanup. The result
-is reported to the orchestrator as a single :class:`WorkerExit` mailbox
-message; the orchestrator's single-writer dispatcher decides what to do
-with it (schedule retry, mark complete, etc.).
+Codex session → transition tracker to ``start_state`` → run a single
+Codex turn → transition tracker to ``success_state`` (with a failure
+comment first when applicable) → cleanup. The result is reported to the
+orchestrator as a single :class:`WorkerExit` mailbox message; the
+orchestrator's single-writer dispatcher decides what to do with it
+(schedule retry, mark complete, etc.).
 
 The worker is a free async function rather than a class — there's no
 state worth carrying across calls, and tests want a flat callable to
 drive with the M6.5 fakes.
 
-Exit reasons (worker-internal vocabulary; freeform per :class:`WorkerExit`):
+State transitions: codex 0.125+ no longer advertises client-side tools
+through the handshake, so the agent can't transition Linear tickets on
+its own. The worker drives transitions instead — once on entry
+(``tracker.start_state``) and once on exit (``tracker.success_state``).
+Each transition is best-effort: a tracker error is logged at WARNING
+and never escalated. ``start_state`` and ``success_state`` may be
+``None`` in config, in which case the corresponding transition is
+skipped entirely (used by tests / minimal setups).
 
-- ``"normal"``               — turn completed and tracker confirms the
-                               issue is no longer active. ``ok=True``.
-- ``"max_turns"``             — agent.max_turns reached without resolution.
-- ``"workspace_failed"``      — ``ensure_for_issue`` raised.
-- ``"before_run_failed"``     — ``before_run`` hook returned non-ok.
-- ``"prompt_failed"``         — Liquid render failed.
-- ``"session_failed"``        — Codex ``start_session`` raised.
-- ``"turn_failed"``           — turn ended with ``turn_failed`` event.
-- ``"turn_cancelled"``        — turn ended with ``turn_cancelled`` event.
-- ``"turn_input_required"``   — turn paused for operator input.
-- ``"turn_timeout"``          — turn exceeded ``codex.turn_timeout_ms``.
-- ``"port_exit"``             — Codex subprocess exited mid-stream.
-- ``"tracker_refresh_failed"``— per-turn state refresh raised.
-- ``"unexpected"``            — defensive catch-all: any exception not
+Single-turn semantics: continuation/``max_turns`` was removed because
+the agent can no longer signal "done" via a tracker mutation. Worker
+issues exactly one ``stream_turn`` and either returns ``normal/ok=True``
+on a clean ``turn/completed`` or maps the typed Codex exception to a
+failure exit reason and ``ok=False``.
+
+Exit reasons (freeform per :class:`WorkerExit`):
+
+- ``"normal"``               — single turn completed cleanly. ``ok=True``.
+- ``"workspace_failed"``     — ``ensure_for_issue`` raised.
+- ``"before_run_failed"``    — ``before_run`` hook returned non-ok.
+- ``"prompt_failed"``        — Liquid render failed.
+- ``"session_failed"``       — Codex ``start_session`` raised.
+- ``"turn_failed"``          — :class:`TurnFailed` raised (mapped from
+                               ``turn/completed`` w/ ``status=failed`` or a
+                               top-level ``error`` notification).
+- ``"turn_cancelled"``       — :class:`TurnCancelled` raised (mapped from
+                               ``turn/completed`` w/ ``status=interrupted``).
+- ``"turn_timeout"``         — turn exceeded ``codex.turn_timeout_ms``.
+- ``"port_exit"``            — Codex subprocess exited mid-stream.
+- ``"unexpected"``           — defensive catch-all: any exception not
                                classified by the typed exits above
                                (e.g. transport closed mid-tool-call,
                                approval-handler bug). Prevents the worker
@@ -53,7 +69,6 @@ from river_gang.codex.errors import (
     PortExit,
     TurnCancelled,
     TurnFailed,
-    TurnInputRequired,
     TurnTimeout,
 )
 from river_gang.config import EffectiveConfig
@@ -61,18 +76,11 @@ from river_gang.observability.logging import session_id_var, set_log_context
 from river_gang.orchestrator.mailbox import CodexUpdate, Mailbox, WorkerExit
 from river_gang.prompt import render_prompt
 from river_gang.prompt.errors import PromptError
-from river_gang.tracker.errors import LinearError
 from river_gang.tracker.issue import Issue
 from river_gang.workspace.hooks import HookResult, run_hook
 from river_gang.workspace.manager import WorkspaceManagerError
 
 logger = logging.getLogger(__name__)
-
-# Continuation prompt sent on turn ≥ 2 (§7.1: "guidance only" payload).
-CONTINUATION_GUIDANCE = (
-    "Continue working on the issue. "
-    "Use the linear_graphql tool to refresh state and check progress."
-)
 
 
 # ---------------------------------------------------------------------------
@@ -113,9 +121,11 @@ class _WorkspaceManagerLike(Protocol):
 
 
 class _TrackerLike(Protocol):
-    async def fetch_issue_states_by_ids(
-        self, issue_ids: list[str]
-    ) -> list[Issue]: ...
+    async def transition_state(
+        self, issue_id: str, state_name: str
+    ) -> None: ...
+
+    async def add_comment(self, issue_id: str, body: str) -> None: ...
 
 
 HookRunner = Callable[..., Awaitable[HookResult]]
@@ -228,13 +238,15 @@ async def _run_agent_attempt_impl(
                 prompt_template, issue=issue, attempt=attempt
             )
         except PromptError as exc:
-            await _post_exit(
+            await _finalize_attempt(
                 mailbox,
+                tracker=tracker,
                 issue=issue,
                 reason="prompt_failed",
                 ok=False,
                 started_at=started_at,
                 last_error=str(exc),
+                config=config,
             )
             return
 
@@ -242,23 +254,27 @@ async def _run_agent_attempt_impl(
         try:
             ensure_result = await workspace_manager.ensure_for_issue(issue.identifier)
         except WorkspaceManagerError as exc:
-            await _post_exit(
+            await _finalize_attempt(
                 mailbox,
+                tracker=tracker,
                 issue=issue,
                 reason="workspace_failed",
                 ok=False,
                 started_at=started_at,
                 last_error=str(exc),
+                config=config,
             )
             return
         except Exception as exc:  # noqa: BLE001 -- defensive against fake/real divergence
-            await _post_exit(
+            await _finalize_attempt(
                 mailbox,
+                tracker=tracker,
                 issue=issue,
                 reason="workspace_failed",
                 ok=False,
                 started_at=started_at,
                 last_error=str(exc),
+                config=config,
             )
             return
 
@@ -272,23 +288,27 @@ async def _run_agent_attempt_impl(
             try:
                 codex_client = await codex_client_factory(workspace_path, config)
             except Exception as exc:  # noqa: BLE001 -- factory failure → session_failed exit
-                await _post_exit(
+                await _finalize_attempt(
                     mailbox,
+                    tracker=tracker,
                     issue=issue,
                     reason="session_failed",
                     ok=False,
                     started_at=started_at,
                     last_error=f"codex_client_factory raised: {exc}",
+                    config=config,
                 )
                 return
         if codex_client is None:
-            await _post_exit(
+            await _finalize_attempt(
                 mailbox,
+                tracker=tracker,
                 issue=issue,
                 reason="session_failed",
                 ok=False,
                 started_at=started_at,
                 last_error="no codex client available (no client and no factory)",
+                config=config,
             )
             return
 
@@ -300,13 +320,15 @@ async def _run_agent_attempt_impl(
                 timeout_ms=config.hooks.timeout_ms,
             )
             if not result.ok:
-                await _post_exit(
+                await _finalize_attempt(
                     mailbox,
+                    tracker=tracker,
                     issue=issue,
                     reason="before_run_failed",
                     ok=False,
                     started_at=started_at,
                     last_error=_summarize_hook_failure("before_run", result),
+                    config=config,
                 )
                 return
 
@@ -325,13 +347,15 @@ async def _run_agent_attempt_impl(
             await _run_after_run_best_effort(
                 hook_runner, config, workspace_path
             )
-            await _post_exit(
+            await _finalize_attempt(
                 mailbox,
+                tracker=tracker,
                 issue=issue,
                 reason="session_failed",
                 ok=False,
                 started_at=started_at,
                 last_error=str(exc),
+                config=config,
             )
             return
 
@@ -340,14 +364,23 @@ async def _run_agent_attempt_impl(
         # in OrchestratorState via on_codex_update, not in worker log lines.
         session_token = session_id_var.set(session.session_id)
 
-        # 5. Streaming loop. session is non-None past here.
+        # 4.5. Transition tracker to ``start_state`` before the agent does any
+        # work. Best-effort: a tracker error here does NOT prevent the turn
+        # from running — operators see a logged WARNING and the ticket stays
+        # in its previous state. The success transition still fires later
+        # regardless, so a transient Linear hiccup at start is recoverable.
+        await _safe_transition(
+            tracker, issue=issue, state_name=config.tracker.start_state
+        )
+
+        # 5. Single Codex turn. Continuation/max_turns is gone — the agent no
+        # longer signals "done" via a tracker mutation, so we run exactly one
+        # turn and treat its outcome as the attempt outcome.
         try:
-            reason, ok, last_error = await _run_turn_loop(
+            reason, ok, last_error = await _run_single_turn(
                 issue=issue,
-                attempt=attempt,
                 mailbox=mailbox,
                 codex_client=codex_client,
-                tracker=tracker,
                 session=session,
                 rendered_prompt=rendered_prompt,
                 config=config,
@@ -371,13 +404,15 @@ async def _run_agent_attempt_impl(
         logger.info("worker exit outcome=%s ok=%s", reason, ok)
         session_id_var.reset(session_token)
 
-        await _post_exit(
+        await _finalize_attempt(
             mailbox,
+            tracker=tracker,
             issue=issue,
             reason=reason,
             ok=ok,
             started_at=started_at,
             last_error=last_error,
+            config=config,
         )
     except Exception as exc:  # noqa: BLE001 -- enforce "Never raises" contract
         # Defensive catch-all: anything that escaped the typed handlers
@@ -390,91 +425,56 @@ async def _run_agent_attempt_impl(
             type(exc).__name__,
             exc_info=True,
         )
-        await _post_exit(
+        await _finalize_attempt(
             mailbox,
+            tracker=tracker,
             issue=issue,
             reason="unexpected",
             ok=False,
             started_at=started_at,
             last_error=str(exc),
+            config=config,
         )
 
 
 # ---------------------------------------------------------------------------
-# Streaming loop
+# Single-turn execution
 # ---------------------------------------------------------------------------
 
 
-async def _run_turn_loop(
+async def _run_single_turn(
     *,
     issue: Issue,
-    attempt: int,
     mailbox: Mailbox,
     codex_client: _CodexClientLike,
-    tracker: _TrackerLike,
     session: Session,
     rendered_prompt: str,
     config: EffectiveConfig,
 ) -> tuple[str, bool, str | None]:
-    """Drive turns until exit. Returns (reason, ok, last_error)."""
-    max_turns = config.agent.max_turns
+    """Run exactly one Codex turn. Returns (reason, ok, last_error)."""
     turn_timeout_ms = config.codex.turn_timeout_ms
-    active_states_norm = {s.lower() for s in config.tracker.active_states}
 
-    turn_number = 1
-    current_issue = issue
-    while True:
-        prompt_for_turn = (
-            rendered_prompt if turn_number == 1 else CONTINUATION_GUIDANCE
+    def _on_event(evt: RuntimeEvent, _id: str = issue.id) -> None:
+        mailbox.send_nowait(CodexUpdate(issue_id=_id, event=evt))
+
+    try:
+        await codex_client.stream_turn(
+            session=session,
+            prompt=rendered_prompt,
+            on_event=_on_event,
+            turn_timeout_ms=turn_timeout_ms,
+            is_first_turn=True,
         )
+    except TurnFailed as exc:
+        return ("turn_failed", False, str(exc))
+    except TurnCancelled as exc:
+        return ("turn_cancelled", False, str(exc))
+    except TurnTimeout as exc:
+        return ("turn_timeout", False, str(exc))
+    except PortExit as exc:
+        return ("port_exit", False, str(exc))
 
-        def _on_event(evt: RuntimeEvent, _id: str = current_issue.id) -> None:
-            mailbox.send_nowait(CodexUpdate(issue_id=_id, event=evt))
-
-        try:
-            await codex_client.stream_turn(
-                session=session,
-                prompt=prompt_for_turn,
-                on_event=_on_event,
-                turn_timeout_ms=turn_timeout_ms,
-                is_first_turn=(turn_number == 1),
-            )
-        except TurnFailed as exc:
-            return ("turn_failed", False, str(exc))
-        except TurnCancelled as exc:
-            return ("turn_cancelled", False, str(exc))
-        except TurnInputRequired as exc:
-            return ("turn_input_required", False, str(exc))
-        except TurnTimeout as exc:
-            return ("turn_timeout", False, str(exc))
-        except PortExit as exc:
-            return ("port_exit", False, str(exc))
-
-        # Turn succeeded. Stop if we've hit the per-attempt cap.
-        if turn_number >= max_turns:
-            return ("max_turns", False, None)
-
-        # Refresh tracker state.
-        try:
-            refreshed = await tracker.fetch_issue_states_by_ids(
-                [current_issue.id]
-            )
-        except LinearError as exc:
-            return ("tracker_refresh_failed", False, str(exc))
-        except Exception as exc:  # noqa: BLE001 -- defensive
-            return ("tracker_refresh_failed", False, str(exc))
-
-        # Issue absent (deleted / not visible) → treat as normal exit.
-        if not refreshed:
-            return ("normal", True, None)
-        refreshed_issue = refreshed[0]
-        if refreshed_issue.state.lower() not in active_states_norm:
-            return ("normal", True, None)
-
-        # Continue with the refreshed snapshot so subsequent turns see
-        # the latest title/blockers/labels if we ever consult them.
-        current_issue = refreshed_issue
-        turn_number += 1
+    return ("normal", True, None)
 
 
 # ---------------------------------------------------------------------------
@@ -482,15 +482,34 @@ async def _run_turn_loop(
 # ---------------------------------------------------------------------------
 
 
-async def _post_exit(
+async def _finalize_attempt(
     mailbox: Mailbox,
     *,
+    tracker: _TrackerLike,
     issue: Issue,
     reason: str,
     ok: bool,
     started_at: datetime,
     last_error: str | None,
+    config: EffectiveConfig,
 ) -> None:
+    """End-of-attempt sequence shared by every exit path.
+
+    Order matters: failure context lands on the issue *before* the success
+    transition moves the ticket out of the active set, otherwise an operator
+    glancing at the (newly Review-bound) issue won't see why it left active
+    states. The transition itself is unconditional — per the product
+    requirement "the ticket always goes to Review, success or failure" —
+    and best-effort: a tracker hiccup just gets logged.
+    """
+    if not ok:
+        await _safe_add_comment(
+            tracker, issue=issue, body=_format_failure_body(reason, last_error)
+        )
+    await _safe_transition(
+        tracker, issue=issue, state_name=config.tracker.success_state
+    )
+
     runtime_seconds = (datetime.now(UTC) - started_at).total_seconds()
     await mailbox.send(
         WorkerExit(
@@ -501,6 +520,55 @@ async def _post_exit(
             last_error=last_error,
         )
     )
+
+
+async def _safe_transition(
+    tracker: _TrackerLike, *, issue: Issue, state_name: str | None
+) -> None:
+    """Best-effort tracker transition; swallows every failure mode.
+
+    ``state_name`` is taken from config and may be ``None`` (transition
+    feature disabled) — no-op in that case. Any exception (transport,
+    GraphQL, unknown state name) is logged at WARNING. The worker MUST
+    NOT propagate tracker failures: a Linear hiccup shouldn't turn into
+    a worker crash that orphans the running entry.
+    """
+    if state_name is None:
+        return
+    try:
+        await tracker.transition_state(issue.id, state_name)
+    except Exception:  # noqa: BLE001 -- best-effort by design
+        logger.warning(
+            "tracker.transition_state(%s -> %r) failed — continuing",
+            issue.identifier,
+            state_name,
+            exc_info=True,
+        )
+
+
+async def _safe_add_comment(
+    tracker: _TrackerLike, *, issue: Issue, body: str
+) -> None:
+    """Best-effort tracker comment; swallows every failure mode."""
+    try:
+        await tracker.add_comment(issue.id, body)
+    except Exception:  # noqa: BLE001 -- best-effort by design
+        logger.warning(
+            "tracker.add_comment(%s) failed — continuing",
+            issue.identifier,
+            exc_info=True,
+        )
+
+
+def _format_failure_body(reason: str, last_error: str | None) -> str:
+    """Render the comment body posted on a failed attempt.
+
+    Kept short and structured (single line per field) so the Linear
+    activity feed stays scannable when many tickets fail in a sweep.
+    """
+    if last_error:
+        return f"river-gang attempt failed: reason={reason}\n\n{last_error}"
+    return f"river-gang attempt failed: reason={reason}"
 
 
 async def _run_after_run_best_effort(
@@ -538,6 +606,5 @@ def _summarize_hook_failure(name: str, result: HookResult) -> str:
 
 
 __all__ = [
-    "CONTINUATION_GUIDANCE",
     "run_agent_attempt",
 ]

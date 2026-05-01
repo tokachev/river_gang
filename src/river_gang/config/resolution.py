@@ -95,6 +95,8 @@ def resolve_and_validate(
         project_slug=base_cfg.tracker.project_slug,
         active_states=base_cfg.tracker.active_states,
         terminal_states=base_cfg.tracker.terminal_states,
+        start_state=base_cfg.tracker.start_state,
+        success_state=base_cfg.tracker.success_state,
     )
 
     workspace = WorkspaceConfig(

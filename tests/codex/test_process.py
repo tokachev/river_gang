@@ -45,7 +45,6 @@ def test_codex_error_hierarchy_is_complete() -> None:
         "ResponseError",
         "TurnFailed",
         "TurnCancelled",
-        "TurnInputRequired",
     }
     for name in expected:
         cls = getattr(e, name)

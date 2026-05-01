@@ -4,12 +4,14 @@ Public entry points:
 
 - :func:`extract_cumulative_tokens` — pulls an absolute :class:`TokenSnapshot`
   from a notification's ``method`` + ``params``, applying §13.5's selection
-  rules:
+  rules against the codex 0.125.0 ``ThreadTokenUsageUpdatedNotification``
+  schema:
 
-  * ``thread/tokenUsage/updated``                — payload IS the cumulative
-  * any event carrying ``total_token_usage``     — that subdict is cumulative
-  * ``last_token_usage`` (key or method)         — IGNORE (delta)
-  * generic ``usage`` map on an unrelated event  — IGNORE (not cumulative)
+  * method ``thread/tokenUsage/updated``  — params carry
+    ``tokenUsage.total`` (cumulative) and ``tokenUsage.last`` (delta).
+    We read ``tokenUsage.total``; ``tokenUsage.last`` is ignored.
+  * any other event                       — IGNORE (generic ``usage`` maps
+    are not cumulative per §13.5).
 
 - :func:`compute_token_delta` — given the previous and current cumulative
   snapshots, returns the per-event delta with negatives clamped to zero so
@@ -20,7 +22,9 @@ Public entry points:
   no rate-limit info is present so callers can short-circuit.
 
 Field-name lookup is lenient (snake_case + camelCase both accepted) per
-§13.5 ("extract … leniently from common field names").
+§13.5 ("extract … leniently from common field names"). The codex schema
+uses camelCase exclusively; snake_case fallbacks remain for forward-compat
+with non-codex producers and to absorb minor schema drift.
 """
 
 from __future__ import annotations
@@ -31,12 +35,13 @@ from typing import Any
 # Method name signalling the spec-defined cumulative payload (§13.5).
 METHOD_TOKEN_USAGE_UPDATED = "thread/tokenUsage/updated"
 
-# Field-name aliases. First hit wins so put the snake_case variant first.
-_INPUT_KEYS = ("input_tokens", "inputTokens")
-_OUTPUT_KEYS = ("output_tokens", "outputTokens")
-_TOTAL_KEYS = ("total_tokens", "totalTokens")
-_TOTAL_USAGE_KEYS = ("total_token_usage", "totalTokenUsage")
-_LAST_USAGE_KEYS = ("last_token_usage", "lastTokenUsage")
+# Field-name aliases. camelCase first because codex emits camelCase; the
+# snake_case fallbacks tolerate non-codex producers.
+_INPUT_KEYS = ("inputTokens", "input_tokens")
+_OUTPUT_KEYS = ("outputTokens", "output_tokens")
+_TOTAL_KEYS = ("totalTokens", "total_tokens")
+_TOKEN_USAGE_KEYS = ("tokenUsage", "token_usage")
+_TOTAL_BREAKDOWN_KEYS = ("total",)
 _RATE_LIMIT_KEYS = ("rate_limit", "rateLimit")
 _RATE_LIMIT_LIMIT = ("limit",)
 _RATE_LIMIT_REMAINING = ("remaining",)
@@ -66,36 +71,33 @@ def extract_cumulative_tokens(
     method: str, payload: dict[str, Any]
 ) -> TokenSnapshot | None:
     """Return the cumulative :class:`TokenSnapshot` carried by this event,
-    or ``None`` if the event doesn't carry one (delta-only, generic usage,
-    no token info, malformed values).
+    or ``None`` if the event doesn't carry one.
+
+    Codex 0.125.0 ``ThreadTokenUsageUpdatedNotification`` shape::
+
+        params: {
+            threadId: str,
+            turnId: str,
+            tokenUsage: {
+                last:  TokenUsageBreakdown,   # delta — ignored
+                total: TokenUsageBreakdown,   # cumulative
+                modelContextWindow: int|null,
+            }
+        }
     """
-    # §13.5: ``last_token_usage`` is a delta — never report as cumulative.
-    if method in _LAST_USAGE_KEYS:
+    if method != METHOD_TOKEN_USAGE_UPDATED:
+        # §13.5: generic ``usage`` maps on unrelated events are NOT cumulative.
         return None
 
-    # 1. Method-level signal — payload itself is the cumulative.
-    if method == METHOD_TOKEN_USAGE_UPDATED:
-        # Use explicit ``is None`` chaining so an outer payload that legitimately
-        # carries an all-zero snapshot is preferred over the nested
-        # ``payload["usage"]`` fallback. (Relying on Python truthiness here
-        # works only because TokenSnapshot has no ``__bool__`` override —
-        # too brittle to depend on.)
-        outer = _read_token_object(payload)
-        if outer is not None:
-            return outer
-        nested = payload.get("usage")
-        if isinstance(nested, dict):
-            return _read_token_object(nested)
+    token_usage = _first_present(payload, _TOKEN_USAGE_KEYS)
+    if not isinstance(token_usage, dict):
         return None
 
-    # 2. Wrapper-level signal — any event with ``total_token_usage`` exposes
-    # cumulative totals inside that subdict regardless of the method name.
-    wrapper = _first_present(payload, _TOTAL_USAGE_KEYS)
-    if isinstance(wrapper, dict):
-        return _read_token_object(wrapper)
+    total = _first_present(token_usage, _TOTAL_BREAKDOWN_KEYS)
+    if not isinstance(total, dict):
+        return None
 
-    # 3. Generic ``usage`` maps on unrelated events are NOT cumulative.
-    return None
+    return _read_token_object(total)
 
 
 def _read_token_object(obj: dict[str, Any] | None) -> TokenSnapshot | None:

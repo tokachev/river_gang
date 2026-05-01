@@ -118,8 +118,8 @@ class ToolResult:
 
     ``data`` and ``errors`` together preserve whatever GraphQL body the
     server returned (including partial data on error responses per §10.5).
-    ``error_message`` is a short human-readable summary suitable for the
-    ``tool_call_response`` frame written back to the agent.
+    ``error_message`` is a short human-readable summary surfaced inside the
+    DynamicToolCallResponse content text written back to the agent.
     """
 
     success: bool

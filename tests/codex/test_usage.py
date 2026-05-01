@@ -1,8 +1,14 @@
-"""Tests for :mod:`river_gang.codex.usage` (SPED §13.5)."""
+"""Tests for :mod:`river_gang.codex.usage` (SPED §13.5).
+
+Schema reference: ``sandbox/codex-schema/v2/ThreadTokenUsageUpdatedNotification.json``.
+The notification ``params`` carry ``tokenUsage.total`` (cumulative) and
+``tokenUsage.last`` (delta); we extract from ``tokenUsage.total`` only.
+"""
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 
@@ -16,6 +22,55 @@ from river_gang.codex.usage import (
     extract_rate_limits,
 )
 from tests.codex.fakes import FakeCodexProcess
+
+# ---------------------------------------------------------------------------
+# Helpers — build schema-shaped payloads
+# ---------------------------------------------------------------------------
+
+
+def _breakdown(
+    *,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    total_tokens: int | None = None,
+    cached_input_tokens: int = 0,
+    reasoning_output_tokens: int = 0,
+) -> dict[str, Any]:
+    """A camelCase ``TokenUsageBreakdown`` per the codex schema."""
+    return {
+        "cachedInputTokens": cached_input_tokens,
+        "inputTokens": input_tokens,
+        "outputTokens": output_tokens,
+        "reasoningOutputTokens": reasoning_output_tokens,
+        "totalTokens": (
+            total_tokens
+            if total_tokens is not None
+            else input_tokens + output_tokens
+        ),
+    }
+
+
+def _token_usage_params(
+    *,
+    last: dict[str, Any] | None = None,
+    total: dict[str, Any] | None = None,
+    model_context_window: int | None = None,
+    thread_id: str = "th-1",
+    turn_id: str = "tn-1",
+) -> dict[str, Any]:
+    """A schema-shaped ``ThreadTokenUsageUpdatedNotification.params``."""
+    token_usage: dict[str, Any] = {
+        "last": last if last is not None else _breakdown(),
+        "total": total if total is not None else _breakdown(),
+    }
+    if model_context_window is not None:
+        token_usage["modelContextWindow"] = model_context_window
+    return {
+        "threadId": thread_id,
+        "turnId": turn_id,
+        "tokenUsage": token_usage,
+    }
+
 
 # ---------------------------------------------------------------------------
 # Dataclass shapes
@@ -39,163 +94,129 @@ def test_rate_limit_snapshot_is_frozen() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_extract_from_thread_token_usage_updated_snake_case() -> None:
-    snap = extract_cumulative_tokens(
-        METHOD_TOKEN_USAGE_UPDATED,
-        {
-            "input_tokens": 100,
-            "output_tokens": 200,
-            "total_tokens": 300,
-        },
-    )
-    assert snap == TokenSnapshot(
-        input_tokens=100, output_tokens=200, total_tokens=300
-    )
-
-
 def test_extract_from_thread_token_usage_updated_camel_case() -> None:
-    """Be lenient about field names per §13.5."""
+    """Codex emits camelCase ``inputTokens`` / ``outputTokens`` / ``totalTokens``."""
     snap = extract_cumulative_tokens(
         METHOD_TOKEN_USAGE_UPDATED,
-        {
-            "inputTokens": 100,
-            "outputTokens": 200,
-            "totalTokens": 300,
-        },
+        _token_usage_params(
+            total=_breakdown(input_tokens=100, output_tokens=200, total_tokens=300),
+        ),
     )
     assert snap == TokenSnapshot(
         input_tokens=100, output_tokens=200, total_tokens=300
     )
 
 
-def test_extract_from_thread_token_usage_updated_nested_under_usage() -> None:
+def test_extract_from_thread_token_usage_updated_snake_case_lenience() -> None:
+    """SPED §13.5 lenience — accept snake_case from non-codex producers."""
     snap = extract_cumulative_tokens(
         METHOD_TOKEN_USAGE_UPDATED,
-        {"usage": {"input_tokens": 5, "output_tokens": 10, "total_tokens": 15}},
+        {
+            "threadId": "th-1",
+            "turnId": "tn-1",
+            "token_usage": {
+                "last": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                "total": {
+                    "input_tokens": 5,
+                    "output_tokens": 10,
+                    "total_tokens": 15,
+                },
+            },
+        },
     )
     assert snap == TokenSnapshot(input_tokens=5, output_tokens=10, total_tokens=15)
 
 
-def test_extract_prefers_outer_zero_snapshot_over_nested_usage_fallback() -> None:
-    """An outer payload that legitimately reports an all-zero
-    :class:`TokenSnapshot` must take precedence over the nested
-    ``payload["usage"]`` fallback. Previously the ``or`` chain would
-    skip an all-zero outer (relying on dataclass truthiness, which is
-    brittle); explicit ``is None`` chaining keeps the outer authority.
-    """
+def test_extract_ignores_last_breakdown_uses_total_only() -> None:
+    """``tokenUsage.last`` is a delta — must NOT be treated as cumulative."""
     snap = extract_cumulative_tokens(
         METHOD_TOKEN_USAGE_UPDATED,
-        {
-            # Outer reports all-zero
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "total_tokens": 0,
-            # Nested would otherwise win under truthiness-based fallback
-            "usage": {"input_tokens": 5, "output_tokens": 10, "total_tokens": 15},
-        },
-    )
-    assert snap == TokenSnapshot(input_tokens=0, output_tokens=0, total_tokens=0)
-
-
-def test_extract_from_thread_token_usage_updated_missing_total_derives_from_sum() -> None:
-    """If the payload omits ``total_tokens`` but has input+output, derive it."""
-    snap = extract_cumulative_tokens(
-        METHOD_TOKEN_USAGE_UPDATED,
-        {"input_tokens": 7, "output_tokens": 13},
-    )
-    assert snap == TokenSnapshot(input_tokens=7, output_tokens=13, total_tokens=20)
-
-
-def test_extract_from_thread_token_usage_updated_empty_payload_returns_none() -> None:
-    assert extract_cumulative_tokens(METHOD_TOKEN_USAGE_UPDATED, {}) is None
-
-
-# ---------------------------------------------------------------------------
-# extract_cumulative_tokens — total_token_usage wrapper path
-# ---------------------------------------------------------------------------
-
-
-def test_extract_from_total_token_usage_wrapper() -> None:
-    """Any event carrying ``total_token_usage`` exposes a cumulative snapshot."""
-    snap = extract_cumulative_tokens(
-        "token_count",
-        {
-            "total_token_usage": {
-                "input_tokens": 10,
-                "output_tokens": 20,
-                "total_tokens": 30,
-            },
-            "last_token_usage": {  # delta — must be ignored
-                "input_tokens": 1,
-                "output_tokens": 2,
-                "total_tokens": 3,
-            },
-        },
+        _token_usage_params(
+            last=_breakdown(input_tokens=1, output_tokens=2, total_tokens=3),
+            total=_breakdown(input_tokens=10, output_tokens=20, total_tokens=30),
+        ),
     )
     assert snap == TokenSnapshot(input_tokens=10, output_tokens=20, total_tokens=30)
 
 
-def test_extract_from_total_token_usage_camel_case_key() -> None:
+def test_extract_zero_total_breakdown_returns_zero_snapshot() -> None:
+    """An all-zero ``total`` breakdown is a legitimate cumulative snapshot,
+    not absent — we must report zeros rather than ``None``."""
     snap = extract_cumulative_tokens(
-        "token_count",
-        {
-            "totalTokenUsage": {
-                "inputTokens": 4,
-                "outputTokens": 6,
-                "totalTokens": 10,
-            }
-        },
+        METHOD_TOKEN_USAGE_UPDATED,
+        _token_usage_params(
+            total=_breakdown(input_tokens=0, output_tokens=0, total_tokens=0),
+        ),
     )
-    assert snap == TokenSnapshot(input_tokens=4, output_tokens=6, total_tokens=10)
+    assert snap == TokenSnapshot(input_tokens=0, output_tokens=0, total_tokens=0)
 
 
-def test_extract_total_token_usage_works_for_arbitrary_method_name() -> None:
-    """The wrapper-key extraction is method-agnostic — the spec says 'within
-    token-count wrapper events' but doesn't fix one method name."""
+def test_extract_missing_total_tokens_derives_from_sum() -> None:
+    """If the breakdown omits ``totalTokens`` but has input+output, derive it.
+
+    The codex schema marks ``totalTokens`` required, but lenience absorbs
+    minor producer drift (§13.5)."""
     snap = extract_cumulative_tokens(
-        "agent_message",
+        METHOD_TOKEN_USAGE_UPDATED,
         {
-            "total_token_usage": {
-                "input_tokens": 1, "output_tokens": 2, "total_tokens": 3,
-            }
+            "threadId": "th-1",
+            "turnId": "tn-1",
+            "tokenUsage": {
+                "last": _breakdown(),
+                "total": {"inputTokens": 7, "outputTokens": 13},
+            },
         },
     )
-    assert snap == TokenSnapshot(input_tokens=1, output_tokens=2, total_tokens=3)
+    assert snap == TokenSnapshot(input_tokens=7, output_tokens=13, total_tokens=20)
+
+
+def test_extract_returns_none_when_token_usage_absent() -> None:
+    """Notification missing the ``tokenUsage`` wrapper carries no signal."""
+    assert extract_cumulative_tokens(
+        METHOD_TOKEN_USAGE_UPDATED,
+        {"threadId": "th-1", "turnId": "tn-1"},
+    ) is None
+
+
+def test_extract_returns_none_when_total_missing() -> None:
+    """A ``tokenUsage`` wrapper without ``total`` cannot produce a cumulative."""
+    assert extract_cumulative_tokens(
+        METHOD_TOKEN_USAGE_UPDATED,
+        {
+            "threadId": "th-1",
+            "turnId": "tn-1",
+            "tokenUsage": {"last": _breakdown()},
+        },
+    ) is None
+
+
+def test_extract_returns_none_for_empty_payload() -> None:
+    assert extract_cumulative_tokens(METHOD_TOKEN_USAGE_UPDATED, {}) is None
 
 
 # ---------------------------------------------------------------------------
-# extract_cumulative_tokens — IGNORE paths
+# extract_cumulative_tokens — IGNORE paths (non-cumulative methods)
 # ---------------------------------------------------------------------------
 
 
-def test_extract_returns_none_for_last_token_usage_only_payload() -> None:
-    """Delta-only payload (``last_token_usage`` without ``total_token_usage``)
-    must NOT be reported as cumulative."""
-    snap = extract_cumulative_tokens(
-        "token_count",
-        {
-            "last_token_usage": {
-                "input_tokens": 5, "output_tokens": 10, "total_tokens": 15,
-            }
-        },
-    )
-    assert snap is None
-
-
-def test_extract_returns_none_for_method_named_last_token_usage() -> None:
-    snap = extract_cumulative_tokens(
-        "last_token_usage",
-        {"input_tokens": 5, "output_tokens": 10, "total_tokens": 15},
-    )
-    assert snap is None
-
-
-def test_extract_returns_none_for_generic_event_with_usage_map() -> None:
+def test_extract_returns_none_for_unrelated_method() -> None:
     """SPED §13.5: 'Do not treat generic usage maps as cumulative totals
     unless the event type defines them that way.'"""
     snap = extract_cumulative_tokens(
-        "agent_message",
-        {"usage": {"input_tokens": 100, "output_tokens": 200, "total_tokens": 300}},
+        "agentMessage",
+        {"usage": {"inputTokens": 100, "outputTokens": 200, "totalTokens": 300}},
+    )
+    assert snap is None
+
+
+def test_extract_returns_none_for_unrelated_method_with_token_usage_key() -> None:
+    """Even if some other notification happens to carry a ``tokenUsage`` key,
+    we only trust the dedicated ``thread/tokenUsage/updated`` method."""
+    snap = extract_cumulative_tokens(
+        "turn/completed",
+        _token_usage_params(
+            total=_breakdown(input_tokens=1, output_tokens=2, total_tokens=3),
+        ),
     )
     assert snap is None
 
@@ -204,10 +225,22 @@ def test_extract_returns_none_when_payload_has_no_token_info() -> None:
     assert extract_cumulative_tokens("notification", {"text": "hi"}) is None
 
 
-def test_extract_returns_none_for_non_dict_total_token_usage() -> None:
+def test_extract_returns_none_for_non_dict_token_usage() -> None:
     snap = extract_cumulative_tokens(
-        "token_count",
-        {"total_token_usage": "not-a-dict"},
+        METHOD_TOKEN_USAGE_UPDATED,
+        {"threadId": "th-1", "turnId": "tn-1", "tokenUsage": "not-a-dict"},
+    )
+    assert snap is None
+
+
+def test_extract_returns_none_for_non_dict_total() -> None:
+    snap = extract_cumulative_tokens(
+        METHOD_TOKEN_USAGE_UPDATED,
+        {
+            "threadId": "th-1",
+            "turnId": "tn-1",
+            "tokenUsage": {"last": _breakdown(), "total": "not-a-dict"},
+        },
     )
     assert snap is None
 
@@ -216,7 +249,15 @@ def test_extract_returns_none_for_non_int_token_values() -> None:
     """Be strict about types — junk values should not produce a snapshot."""
     snap = extract_cumulative_tokens(
         METHOD_TOKEN_USAGE_UPDATED,
-        {"input_tokens": "many", "output_tokens": "more", "total_tokens": "lots"},
+        _token_usage_params(
+            total={
+                "inputTokens": "many",
+                "outputTokens": "more",
+                "totalTokens": "lots",
+                "cachedInputTokens": 0,
+                "reasoningOutputTokens": 0,
+            },
+        ),
     )
     assert snap is None
 
@@ -225,7 +266,15 @@ def test_extract_rejects_bool_token_values() -> None:
     """``True``/``False`` are int subclasses but never real token counts."""
     snap = extract_cumulative_tokens(
         METHOD_TOKEN_USAGE_UPDATED,
-        {"input_tokens": True, "output_tokens": False, "total_tokens": 1},
+        _token_usage_params(
+            total={
+                "inputTokens": True,
+                "outputTokens": False,
+                "totalTokens": 1,
+                "cachedInputTokens": 0,
+                "reasoningOutputTokens": 0,
+            },
+        ),
     )
     assert snap is None
 
@@ -318,11 +367,19 @@ def _session() -> Session:
 
 
 def _ack(turn_id: str = "tn-1", *, request_id: int = 1) -> dict[str, object]:
-    return {"jsonrpc": "2.0", "id": request_id, "result": {"turnId": turn_id}}
+    return {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {"turn": {"id": turn_id, "status": "inProgress"}},
+    }
 
 
 def _evt(method: str, **params: object) -> dict[str, object]:
     return {"jsonrpc": "2.0", "method": method, "params": dict(params)}
+
+
+def _turn_completed(turn_id: str = "tn-1", status: str = "completed") -> dict[str, object]:
+    return _evt("turn/completed", turn={"id": turn_id, "status": status})
 
 
 async def test_stream_turn_populates_runtime_event_usage_for_token_event() -> None:
@@ -331,11 +388,11 @@ async def test_stream_turn_populates_runtime_event_usage_for_token_event() -> No
         _ack(turn_id="tn-1"),
         _evt(
             METHOD_TOKEN_USAGE_UPDATED,
-            input_tokens=100,
-            output_tokens=200,
-            total_tokens=300,
+            **_token_usage_params(
+                total=_breakdown(input_tokens=100, output_tokens=200, total_tokens=300),
+            ),
         ),
-        _evt("turn_completed"),
+        _turn_completed(),
     )
     client = CodexClient(process=fake, codex_app_server_pid=1)
     received: list[RuntimeEvent] = []
@@ -361,7 +418,7 @@ async def test_stream_turn_leaves_runtime_event_usage_none_for_non_token_event()
     fake.queue(
         _ack(turn_id="tn-1"),
         _evt("notification", text="hello"),
-        _evt("turn_completed"),
+        _turn_completed(),
     )
     client = CodexClient(process=fake, codex_app_server_pid=1)
     received: list[RuntimeEvent] = []
@@ -376,16 +433,17 @@ async def test_stream_turn_leaves_runtime_event_usage_none_for_non_token_event()
 
 
 async def test_stream_turn_does_not_promote_generic_usage_map_to_cumulative() -> None:
-    """An ``agent_message`` event with a ``usage`` map MUST NOT populate
-    ``RuntimeEvent.usage`` — that field is reserved for cumulative totals."""
+    """An ``agentMessage`` event with a ``usage`` map MUST NOT populate
+    ``RuntimeEvent.usage`` — that field is reserved for cumulative totals
+    from ``thread/tokenUsage/updated`` only."""
     fake = FakeCodexProcess()
     fake.queue(
         _ack(),
         _evt(
-            "agent_message",
-            usage={"input_tokens": 5, "output_tokens": 5, "total_tokens": 10},
+            "agentMessage",
+            usage={"inputTokens": 5, "outputTokens": 5, "totalTokens": 10},
         ),
-        _evt("turn_completed"),
+        _turn_completed(),
     )
     client = CodexClient(process=fake, codex_app_server_pid=1)
     received: list[RuntimeEvent] = []
@@ -395,5 +453,5 @@ async def test_stream_turn_does_not_promote_generic_usage_map_to_cumulative() ->
         on_event=received.append,
         turn_timeout_ms=5000,
     )
-    msg = next(e for e in received if e.event == "agent_message")
+    msg = next(e for e in received if e.event == "agentMessage")
     assert msg.usage is None

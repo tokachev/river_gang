@@ -101,3 +101,27 @@ class LinearUnknownPayload(LinearError):  # noqa: N818 -- spec-defined name
 
 class LinearMissingEndCursor(LinearError):  # noqa: N818 -- spec-defined name
     """Connection page reported ``hasNextPage`` but omitted ``endCursor``."""
+
+
+# ---------------------------------------------------------------------------
+# Mutations / state transitions
+# ---------------------------------------------------------------------------
+
+
+class LinearStateNotFound(LinearError):  # noqa: N818 -- spec-defined name
+    """Workflow state with the given name does not exist on the issue's team.
+
+    Raised by :meth:`LinearClient.transition_state` when the resolver could
+    not map the requested state name to a workflow ``stateId`` after fetching
+    the team's full state list.
+    """
+
+    def __init__(self, state_name: str, *, team_id: str | None = None) -> None:
+        if team_id is None:
+            super().__init__(f"workflow state {state_name!r} not found on team")
+        else:
+            super().__init__(
+                f"workflow state {state_name!r} not found on team {team_id}"
+            )
+        self.state_name = state_name
+        self.team_id = team_id

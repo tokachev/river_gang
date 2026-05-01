@@ -10,7 +10,7 @@ Two doubles:
   by a queue of :class:`TurnScenario` objects. Used by orchestrator
   integration tests in M7 — they don't care about the wire protocol and
   just need to choreograph turn outcomes (completed / failed / cancelled /
-  input_required / timeout / port_exit).
+  timeout / port_exit).
 """
 
 from __future__ import annotations
@@ -28,7 +28,6 @@ from river_gang.codex.errors import (
     PortExit,
     TurnCancelled,
     TurnFailed,
-    TurnInputRequired,
     TurnTimeout,
 )
 from river_gang.tracker.issue import Issue
@@ -123,7 +122,6 @@ _TURN_OUTCOMES = (
     "completed",
     "failed",
     "cancelled",
-    "input_required",
     "timeout",
     "port_exit",
 )
@@ -149,15 +147,13 @@ class TurnScenario:
     - ``"failed"``          → raises :class:`TurnFailed` with optional
       ``reason``.
     - ``"cancelled"``       → raises :class:`TurnCancelled`.
-    - ``"input_required"``  → raises :class:`TurnInputRequired`.
     - ``"timeout"``         → raises :class:`TurnTimeout`.
     - ``"port_exit"``       → raises :class:`PortExit`.
     """
 
     events: list[dict[str, Any]] = field(default_factory=list)
     outcome: Literal[
-        "completed", "failed", "cancelled", "input_required", "timeout",
-        "port_exit",
+        "completed", "failed", "cancelled", "timeout", "port_exit",
     ] = "completed"
     completion_payload: dict[str, Any] = field(default_factory=dict)
     reason: str | None = None
@@ -285,10 +281,6 @@ class FakeCodexClient:
             raise TurnFailed(f"turn {scenario.turn_id} failed: {reason}")
         if scenario.outcome == "cancelled":
             raise TurnCancelled(f"turn {scenario.turn_id} cancelled")
-        if scenario.outcome == "input_required":
-            raise TurnInputRequired(
-                f"turn {scenario.turn_id} requested user input"
-            )
         if scenario.outcome == "timeout":
             raise TurnTimeout(
                 f"turn {scenario.turn_id} exceeded {turn_timeout_ms}ms"

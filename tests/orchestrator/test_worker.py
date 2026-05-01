@@ -1,4 +1,12 @@
-"""Tests for :mod:`river_gang.orchestrator.worker` (SPED §16.5, §7.1, §9.4)."""
+"""Tests for :mod:`river_gang.orchestrator.worker` (SPED §16.5, §7.1, §9.4).
+
+Continuation/``max_turns`` was removed when state transitions moved into
+the orchestrator (codex 0.125+ no longer advertises client-side tools, so
+the agent can't signal "done" through Linear). The worker runs exactly
+one turn per attempt; tests assert that single-turn semantics plus the
+new tracker-side transitions (``start_state`` on entry, ``success_state``
+on exit, failure comment first).
+"""
 
 from __future__ import annotations
 
@@ -17,7 +25,8 @@ from river_gang.orchestrator import (
     OrchestratorMessage,
     WorkerExit,
 )
-from river_gang.orchestrator.worker import CONTINUATION_GUIDANCE, run_agent_attempt
+from river_gang.orchestrator.worker import run_agent_attempt
+from river_gang.tracker.errors import LinearError
 from river_gang.tracker.issue import Issue
 from river_gang.workspace.hooks import HookResult
 from river_gang.workspace.manager import WorkspaceHookFailed
@@ -49,18 +58,23 @@ def _issue(*, id: str = "iss-1", state: str = "In Progress") -> Issue:
 
 def _config(
     *,
-    max_turns: int = 3,
     before_run: str | None = None,
     after_run: str | None = None,
+    start_state: str | None = "In Progress",
+    success_state: str | None = "In Review",
 ) -> EffectiveConfig:
     base = apply_defaults({})
-    new_agent = dataclasses.replace(base.agent, max_turns=max_turns)
     new_hooks = dataclasses.replace(
         base.hooks,
         before_run=before_run,
         after_run=after_run,
     )
-    return dataclasses.replace(base, agent=new_agent, hooks=new_hooks)
+    new_tracker = dataclasses.replace(
+        base.tracker,
+        start_state=start_state,
+        success_state=success_state,
+    )
+    return dataclasses.replace(base, hooks=new_hooks, tracker=new_tracker)
 
 
 def _ok_result() -> HookResult:
@@ -83,10 +97,6 @@ def _fail_result(exit_code: int = 1) -> HookResult:
         timed_out=False,
         is_skipped=False,
     )
-
-
-def _skip_result() -> HookResult:
-    return HookResult.skipped()
 
 
 def _hook_runner_returning(
@@ -133,7 +143,7 @@ def workspace_root(tmp_path: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 
-async def test_happy_path_normal_exit_after_terminal_refresh(
+async def test_happy_path_runs_one_turn_and_transitions(
     workspace_root: Path,
 ) -> None:
     issue = _issue(id="iss-1")
@@ -146,10 +156,10 @@ async def test_happy_path_normal_exit_after_terminal_refresh(
         )
     )
     workspace = FakeWorkspaceManager(root_path=workspace_root)
-    tracker = FakeTracker(state_refreshes={"iss-1": "Done"})
+    tracker = FakeTracker()
 
     runner, runner_calls = _hook_runner_returning()
-    config = _config(max_turns=5)
+    config = _config()
     template = "Working on {{ issue.identifier }} attempt {{ attempt }}"
 
     await run_agent_attempt(
@@ -185,53 +195,39 @@ async def test_happy_path_normal_exit_after_terminal_refresh(
     assert "ensure_for_issue" in method_names
     assert "cleanup_for_issue" not in method_names
 
-    # Codex session lifecycle: start → stream → stop.
+    # Codex session lifecycle: start → ONE stream → stop. No continuation loop.
     codex_methods = [c[0] for c in codex.calls]
     assert codex_methods == ["start_session", "stream_turn", "stop_session"]
 
-    # Tracker refreshed exactly once after the turn (saw Done → exit normally).
-    refresh_calls = [c for c in tracker.calls if c[0] == "fetch_issue_states_by_ids"]
-    assert len(refresh_calls) == 1
-    assert refresh_calls[0][1]["issue_ids"] == ["iss-1"]
+    # Tracker drove start_state on entry, success_state on exit. Comments
+    # never fire on a clean exit.
+    assert tracker.transitions == [
+        ("iss-1", "In Progress"),
+        ("iss-1", "In Review"),
+    ]
+    assert tracker.comments == []
+
+    # No legacy state-refresh inside the worker — that's reconcile's job.
+    assert all(c[0] != "fetch_issue_states_by_ids" for c in tracker.calls)
 
     # No hooks configured → runner never invoked.
     assert runner_calls == []
 
 
-# ---------------------------------------------------------------------------
-# First turn vs continuation turn
-# ---------------------------------------------------------------------------
-
-
-async def test_first_turn_full_prompt_continuation_uses_guidance(
+async def test_first_turn_uses_full_prompt_no_continuation(
     workspace_root: Path,
 ) -> None:
+    """Single-turn semantics: stream_turn is called exactly once with the
+    rendered prompt and ``is_first_turn=True``. No continuation guidance.
+    """
     issue = _issue(id="iss-1")
     mbox = Mailbox()
     codex = FakeCodexClient()
-    # Two completed turns so we exercise both branches.
     codex.queue_turn(TurnScenario(outcome="completed", turn_id="t1"))
-    codex.queue_turn(TurnScenario(outcome="completed", turn_id="t2"))
-
     workspace = FakeWorkspaceManager(root_path=workspace_root)
-    # Refresh keeps state active after turn 1, then goes terminal after turn 2.
     tracker = FakeTracker()
-    tracker._state_refreshes = {"iss-1": "In Progress"}  # noqa: SLF001 -- direct mutation
-
     template = "Initial prompt for {{ issue.identifier }}"
     runner, _ = _hook_runner_returning()
-
-    # Mutate refreshes per call: first refresh keeps active, second goes Done.
-    state_iter = iter(["In Progress", "Done"])
-
-    original_refresh = tracker.fetch_issue_states_by_ids
-
-    async def patched_refresh(issue_ids: list[str]) -> list[Issue]:
-        next_state = next(state_iter)
-        tracker.set_state_refreshes({iid: next_state for iid in issue_ids})
-        return await original_refresh(issue_ids)
-
-    tracker.fetch_issue_states_by_ids = patched_refresh  # type: ignore[method-assign]
 
     await run_agent_attempt(
         issue=issue,
@@ -241,28 +237,25 @@ async def test_first_turn_full_prompt_continuation_uses_guidance(
         workspace_manager=workspace,  # type: ignore[arg-type]
         tracker=tracker,  # type: ignore[arg-type]
         prompt_template=template,
-        config=_config(max_turns=5),
+        config=_config(),
         hook_runner=runner,
     )
 
     stream_calls = [c for c in codex.calls if c[0] == "stream_turn"]
-    assert len(stream_calls) == 2
-
-    first = stream_calls[0][1]
-    assert first["is_first_turn"] is True
-    assert first["prompt"] == "Initial prompt for MT-iss-1"
-
-    second = stream_calls[1][1]
-    assert second["is_first_turn"] is False
-    assert second["prompt"] == CONTINUATION_GUIDANCE
+    assert len(stream_calls) == 1
+    only = stream_calls[0][1]
+    assert only["is_first_turn"] is True
+    assert only["prompt"] == "Initial prompt for MT-iss-1"
 
 
 # ---------------------------------------------------------------------------
-# Workspace failure
+# Pre-codex failures: workspace / prompt / before_run
 # ---------------------------------------------------------------------------
 
 
-async def test_workspace_failure_short_circuits(workspace_root: Path) -> None:
+async def test_workspace_failure_still_finalizes_via_tracker(
+    workspace_root: Path,
+) -> None:
     issue = _issue(id="iss-1")
     mbox = Mailbox()
     codex = FakeCodexClient()
@@ -295,16 +288,19 @@ async def test_workspace_failure_short_circuits(workspace_root: Path) -> None:
 
     # No session created → no codex calls beyond nothing.
     assert codex.calls == []
+    # Pre-codex failures still finalize: comment + success_state transition.
+    # No start_state transition because we never reached start_session.
+    assert tracker.transitions == [("iss-1", "In Review")]
+    assert len(tracker.comments) == 1
+    assert tracker.comments[0][0] == "iss-1"
+    assert "workspace_failed" in tracker.comments[0][1]
     # No before_run/after_run hooks invoked.
     assert runner_calls == []
 
 
-# ---------------------------------------------------------------------------
-# Prompt failure
-# ---------------------------------------------------------------------------
-
-
-async def test_prompt_failure_short_circuits(workspace_root: Path) -> None:
+async def test_prompt_failure_finalizes_without_workspace(
+    workspace_root: Path,
+) -> None:
     issue = _issue(id="iss-1")
     mbox = Mailbox()
     codex = FakeCodexClient()
@@ -332,20 +328,18 @@ async def test_prompt_failure_short_circuits(workspace_root: Path) -> None:
     assert len(exits) == 1
     assert exits[0].reason == "prompt_failed"
     assert exits[0].ok is False
-    assert exits[0].last_error is not None
 
     # Workspace + codex + hooks must not have been touched.
     assert workspace.calls == []
     assert codex.calls == []
     assert runner_calls == []
+    # Tracker still finalized with comment + success_state transition.
+    assert tracker.transitions == [("iss-1", "In Review")]
+    assert len(tracker.comments) == 1
+    assert "prompt_failed" in tracker.comments[0][1]
 
 
-# ---------------------------------------------------------------------------
-# before_run hook failure
-# ---------------------------------------------------------------------------
-
-
-async def test_before_run_hook_failure_blocks_session(
+async def test_before_run_hook_failure_finalizes(
     workspace_root: Path,
 ) -> None:
     issue = _issue(id="iss-1")
@@ -380,14 +374,13 @@ async def test_before_run_hook_failure_blocks_session(
     assert len(runner_calls) == 1
     assert runner_calls[0]["script"] == "echo before"
     assert codex.calls == []
+    # Finalize sequence still ran: comment + success_state transition.
+    assert tracker.transitions == [("iss-1", "In Review")]
+    assert len(tracker.comments) == 1
+    assert "before_run_failed" in tracker.comments[0][1]
 
 
-# ---------------------------------------------------------------------------
-# Session-start failure: after_run still runs (best-effort cleanup)
-# ---------------------------------------------------------------------------
-
-
-async def test_session_failure_runs_after_run_hook(
+async def test_session_failure_runs_after_run_hook_and_finalizes(
     workspace_root: Path,
 ) -> None:
     issue = _issue(id="iss-1")
@@ -422,46 +415,11 @@ async def test_session_failure_runs_after_run_hook(
     assert [c["script"] for c in runner_calls] == ["echo after"]
     # stop_session NOT called because no Session was returned.
     assert "stop_session" not in [c[0] for c in codex.calls]
-
-
-# ---------------------------------------------------------------------------
-# Max turns boundary
-# ---------------------------------------------------------------------------
-
-
-async def test_max_turns_break_when_state_stays_active(
-    workspace_root: Path,
-) -> None:
-    issue = _issue(id="iss-1")
-    mbox = Mailbox()
-    codex = FakeCodexClient()
-    # 2 successful turns; max_turns=2 so we break after the second.
-    codex.queue_turn(TurnScenario(outcome="completed", turn_id="t1"))
-    codex.queue_turn(TurnScenario(outcome="completed", turn_id="t2"))
-    workspace = FakeWorkspaceManager(root_path=workspace_root)
-    tracker = FakeTracker(state_refreshes={"iss-1": "In Progress"})
-
-    runner, _ = _hook_runner_returning()
-    await run_agent_attempt(
-        issue=issue,
-        attempt=1,
-        mailbox=mbox,
-        codex_client=codex,  # type: ignore[arg-type]
-        workspace_manager=workspace,  # type: ignore[arg-type]
-        tracker=tracker,  # type: ignore[arg-type]
-        prompt_template="prompt",
-        config=_config(max_turns=2),
-        hook_runner=runner,
-    )
-
-    msgs = _drain(mbox)
-    exits = [m for m in msgs if isinstance(m, WorkerExit)]
-    assert len(exits) == 1
-    assert exits[0].reason == "max_turns"
-    assert exits[0].ok is False
-    # Two stream_turn calls actually happened.
-    stream_calls = [c for c in codex.calls if c[0] == "stream_turn"]
-    assert len(stream_calls) == 2
+    # No start_state transition — that fires AFTER start_session succeeds.
+    # Finalize still ran: comment + success_state.
+    assert tracker.transitions == [("iss-1", "In Review")]
+    assert len(tracker.comments) == 1
+    assert "session_failed" in tracker.comments[0][1]
 
 
 # ---------------------------------------------------------------------------
@@ -474,12 +432,11 @@ async def test_max_turns_break_when_state_stays_active(
     [
         ("failed", "turn_failed"),
         ("cancelled", "turn_cancelled"),
-        ("input_required", "turn_input_required"),
         ("timeout", "turn_timeout"),
         ("port_exit", "port_exit"),
     ],
 )
-async def test_turn_error_variants_propagate(
+async def test_turn_error_variants_propagate_and_finalize(
     outcome: str,
     expected_reason: str,
     workspace_root: Path,
@@ -516,46 +473,14 @@ async def test_turn_error_variants_propagate(
     assert "stop_session" in [c[0] for c in codex.calls]
     # after_run hook was invoked (best-effort cleanup).
     assert [c["script"] for c in runner_calls] == ["echo cleanup"]
-
-
-# ---------------------------------------------------------------------------
-# Tracker refresh failure inside the loop
-# ---------------------------------------------------------------------------
-
-
-async def test_tracker_refresh_failure_inside_loop(
-    workspace_root: Path,
-) -> None:
-    from river_gang.tracker.errors import LinearError
-
-    issue = _issue(id="iss-1")
-    mbox = Mailbox()
-    codex = FakeCodexClient()
-    codex.queue_turn(TurnScenario(outcome="completed", turn_id="t1"))
-    workspace = FakeWorkspaceManager(root_path=workspace_root)
-    tracker = FakeTracker(state_refreshes={"iss-1": "In Progress"})
-    tracker.fail_next_state_refreshes(LinearError("network down"))
-
-    runner, _ = _hook_runner_returning()
-    await run_agent_attempt(
-        issue=issue,
-        attempt=1,
-        mailbox=mbox,
-        codex_client=codex,  # type: ignore[arg-type]
-        workspace_manager=workspace,  # type: ignore[arg-type]
-        tracker=tracker,  # type: ignore[arg-type]
-        prompt_template="prompt",
-        config=_config(max_turns=5),
-        hook_runner=runner,
-    )
-
-    msgs = _drain(mbox)
-    exits = [m for m in msgs if isinstance(m, WorkerExit)]
-    assert len(exits) == 1
-    assert exits[0].reason == "tracker_refresh_failed"
-    assert exits[0].ok is False
-    # stop_session still called.
-    assert "stop_session" in [c[0] for c in codex.calls]
+    # Both transitions fired (start before turn, success after) plus a
+    # failure comment for the failure exit.
+    assert tracker.transitions == [
+        ("iss-1", "In Progress"),
+        ("iss-1", "In Review"),
+    ]
+    assert len(tracker.comments) == 1
+    assert expected_reason in tracker.comments[0][1]
 
 
 # ---------------------------------------------------------------------------
@@ -572,7 +497,7 @@ async def test_after_run_hook_failure_does_not_change_success(
     codex = FakeCodexClient()
     codex.queue_turn(TurnScenario(outcome="completed", turn_id="t1"))
     workspace = FakeWorkspaceManager(root_path=workspace_root)
-    tracker = FakeTracker(state_refreshes={"iss-1": "Done"})
+    tracker = FakeTracker()
 
     runner, runner_calls = _hook_runner_returning(_fail_result(exit_code=42))
     config = _config(after_run="echo after")
@@ -607,6 +532,138 @@ async def test_after_run_hook_failure_does_not_change_success(
 
 
 # ---------------------------------------------------------------------------
+# Tracker mutation behaviour
+# ---------------------------------------------------------------------------
+
+
+async def test_no_transitions_when_states_are_None_in_config(
+    workspace_root: Path,
+) -> None:
+    """If both ``start_state`` and ``success_state`` are unset, the worker
+    must skip transitions entirely. Failure comments still fire — the
+    "tell the operator what broke" channel is independent of the
+    transition feature flag.
+    """
+    issue = _issue(id="iss-1")
+    mbox = Mailbox()
+    codex = FakeCodexClient()
+    codex.queue_turn(TurnScenario(outcome="completed", turn_id="t1"))
+    workspace = FakeWorkspaceManager(root_path=workspace_root)
+    tracker = FakeTracker()
+    runner, _ = _hook_runner_returning()
+
+    await run_agent_attempt(
+        issue=issue,
+        attempt=1,
+        mailbox=mbox,
+        codex_client=codex,  # type: ignore[arg-type]
+        workspace_manager=workspace,  # type: ignore[arg-type]
+        tracker=tracker,  # type: ignore[arg-type]
+        prompt_template="prompt",
+        config=_config(start_state=None, success_state=None),
+        hook_runner=runner,
+    )
+
+    assert tracker.transitions == []
+    # Successful exit → no comment either.
+    assert tracker.comments == []
+
+
+async def test_transition_failure_logs_and_continues(
+    workspace_root: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A LinearError on the start-state transition must NOT prevent the
+    turn from running. Worker logs and proceeds; the success transition
+    still fires (independently best-effort).
+    """
+    issue = _issue(id="iss-1")
+    mbox = Mailbox()
+    codex = FakeCodexClient()
+    codex.queue_turn(TurnScenario(outcome="completed", turn_id="t1"))
+    workspace = FakeWorkspaceManager(root_path=workspace_root)
+    tracker = FakeTracker()
+    tracker.fail_next_transition(LinearError("transient network error"))
+    runner, _ = _hook_runner_returning()
+
+    with caplog.at_level(logging.WARNING, logger="river_gang.orchestrator.worker"):
+        await run_agent_attempt(
+            issue=issue,
+            attempt=1,
+            mailbox=mbox,
+            codex_client=codex,  # type: ignore[arg-type]
+            workspace_manager=workspace,  # type: ignore[arg-type]
+            tracker=tracker,  # type: ignore[arg-type]
+            prompt_template="prompt",
+            config=_config(),
+            hook_runner=runner,
+        )
+
+    exits = [m for m in _drain(mbox) if isinstance(m, WorkerExit)]
+    assert len(exits) == 1
+    # Worker still considers the run successful — transition failure is
+    # observability noise, not a worker-level failure.
+    assert exits[0].reason == "normal"
+    assert exits[0].ok is True
+
+    # Both transitions were attempted (start failed, success succeeded).
+    assert tracker.transitions == [
+        ("iss-1", "In Progress"),
+        ("iss-1", "In Review"),
+    ]
+    # The failure landed in the warning log.
+    assert any(
+        "transition_state" in rec.message
+        for rec in caplog.records
+    ), caplog.text
+
+
+async def test_comment_failure_logs_and_continues(
+    workspace_root: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A LinearError on add_comment during a failure exit must NOT escape;
+    the success-state transition still runs.
+    """
+    issue = _issue(id="iss-1")
+    mbox = Mailbox()
+    codex = FakeCodexClient()
+    codex.queue_turn(TurnScenario(outcome="failed"))
+    workspace = FakeWorkspaceManager(root_path=workspace_root)
+    tracker = FakeTracker()
+    tracker.fail_next_comment(LinearError("comment endpoint 500"))
+    runner, _ = _hook_runner_returning()
+
+    with caplog.at_level(logging.WARNING, logger="river_gang.orchestrator.worker"):
+        await run_agent_attempt(
+            issue=issue,
+            attempt=1,
+            mailbox=mbox,
+            codex_client=codex,  # type: ignore[arg-type]
+            workspace_manager=workspace,  # type: ignore[arg-type]
+            tracker=tracker,  # type: ignore[arg-type]
+            prompt_template="prompt",
+            config=_config(),
+            hook_runner=runner,
+        )
+
+    exits = [m for m in _drain(mbox) if isinstance(m, WorkerExit)]
+    assert len(exits) == 1
+    assert exits[0].reason == "turn_failed"
+    assert exits[0].ok is False
+    # Comment was attempted and logged; success transition still landed.
+    assert len(tracker.comments) == 1
+    assert tracker.transitions == [
+        ("iss-1", "In Progress"),
+        ("iss-1", "In Review"),
+    ]
+    assert any(
+        "add_comment" in rec.message
+        for rec in caplog.records
+    ), caplog.text
+
+
+# ---------------------------------------------------------------------------
 # before_remove must NOT be called by worker (§9.4 differentiation)
 # ---------------------------------------------------------------------------
 
@@ -619,7 +676,7 @@ async def test_worker_does_not_invoke_before_remove(
     codex = FakeCodexClient()
     codex.queue_turn(TurnScenario(outcome="completed", turn_id="t1"))
     workspace = FakeWorkspaceManager(root_path=workspace_root)
-    tracker = FakeTracker(state_refreshes={"iss-1": "Done"})
+    tracker = FakeTracker()
     runner, _ = _hook_runner_returning()
 
     await run_agent_attempt(
@@ -702,7 +759,7 @@ async def test_unexpected_exception_in_stream_turn_becomes_worker_exit(
     mbox = Mailbox()
     codex = FakeCodexClient()
     workspace = FakeWorkspaceManager(root_path=workspace_root)
-    tracker = FakeTracker(state_refreshes={"iss-1": "In Progress"})
+    tracker = FakeTracker()
 
     # Override stream_turn to raise a bare RuntimeError — simulating the
     # closed-LinearTransport / approval-handler-bug failure modes that
@@ -716,7 +773,6 @@ async def test_unexpected_exception_in_stream_turn_becomes_worker_exit(
     codex.stream_turn = _raise_runtime_error  # type: ignore[method-assign]
 
     runner, _ = _hook_runner_returning()
-    config = _config(max_turns=3)
 
     with caplog.at_level(logging.ERROR, logger="river_gang.orchestrator.worker"):
         # Must not raise — that's the contract under test.
@@ -728,7 +784,7 @@ async def test_unexpected_exception_in_stream_turn_becomes_worker_exit(
             workspace_manager=workspace,  # type: ignore[arg-type]
             tracker=tracker,  # type: ignore[arg-type]
             prompt_template="prompt",
-            config=config,
+            config=_config(),
             hook_runner=runner,
         )
 
@@ -766,7 +822,7 @@ async def test_unexpected_exception_in_run_agent_attempt_does_not_leak(
     mbox = Mailbox()
     codex = FakeCodexClient()
     workspace = FakeWorkspaceManager(root_path=workspace_root)
-    tracker = FakeTracker(state_refreshes={"iss-2": "In Progress"})
+    tracker = FakeTracker()
 
     async def _raise(**_: object) -> None:
         raise RuntimeError("approval handler crashed")

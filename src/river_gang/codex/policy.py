@@ -18,36 +18,68 @@ Policy:
 
 Operational consequence:
     The orchestrator NEVER pauses waiting for an external decision. A
-    request that cannot be auto-resolved becomes a typed exit (``TurnFailed``,
-    ``TurnInputRequired``) so the worker exits cleanly and the retry layer
-    can decide what to do next.
+    request that cannot be auto-resolved becomes a typed exit (``TurnFailed``)
+    so the worker exits cleanly and the retry layer can decide what to do
+    next.
+
+Wire format (codex 0.125.0+ ServerRequest dispatch):
+    Approvals are JSON-RPC server requests, not notifications. The five
+    approval methods carry distinct response schemas — :class:`ApprovalHandler`
+    returns the matching ``result`` dict per method, which the dispatcher
+    wraps as ``{id, result}``. Two response shapes exist:
+
+    - ``decision`` (string enum): ``applyPatchApproval``,
+      ``execCommandApproval``, ``item/commandExecution/requestApproval``,
+      ``item/fileChange/requestApproval``.
+    - ``permissions`` (object): ``item/permissions/requestApproval`` —
+      grants an empty :file:`GrantedPermissionProfile` (since the OS-level
+      sandbox is the operative authority, no extra grant is needed).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import Any
-
-from river_gang.codex.protocol import JSONRPC_VERSION
 
 APPROVAL_POLICY_NEVER = "never"
 SANDBOX_POLICY_WORKSPACE_WRITE = "workspace-write"
 
-EVENT_APPROVAL_REQUEST = "approval_request"
-EVENT_APPROVAL_AUTO_APPROVED = "approval_auto_approved"
-EVENT_APPROVAL_DENIED = "approval_denied"
+# Approval method names (codex 0.125.0+ ServerRequest schema). Each method
+# carries its own *ApprovalParams / *ApprovalResponse pair.
+METHOD_APPLY_PATCH_APPROVAL = "applyPatchApproval"
+METHOD_EXEC_COMMAND_APPROVAL = "execCommandApproval"
+METHOD_ITEM_COMMAND_EXECUTION_REQUEST_APPROVAL = (
+    "item/commandExecution/requestApproval"
+)
+METHOD_ITEM_FILE_CHANGE_REQUEST_APPROVAL = "item/fileChange/requestApproval"
+METHOD_ITEM_PERMISSIONS_REQUEST_APPROVAL = "item/permissions/requestApproval"
 
-METHOD_APPROVAL_RESPONSE = "approval_response"
+APPROVAL_METHODS: tuple[str, ...] = (
+    METHOD_APPLY_PATCH_APPROVAL,
+    METHOD_EXEC_COMMAND_APPROVAL,
+    METHOD_ITEM_COMMAND_EXECUTION_REQUEST_APPROVAL,
+    METHOD_ITEM_FILE_CHANGE_REQUEST_APPROVAL,
+    METHOD_ITEM_PERMISSIONS_REQUEST_APPROVAL,
+)
 
+# ReviewDecision (ApplyPatchApprovalResponse / ExecCommandApprovalResponse).
+_REVIEW_DECISION_APPROVED = "approved"
+_REVIEW_DECISION_DENIED = "denied"
 
-@dataclass(frozen=True)
-class ApprovalDecision:
-    response_frame: dict[str, Any]
-    observability_event_method: str
+# CommandExecutionApprovalDecision / FileChangeApprovalDecision.
+_ITEM_DECISION_ACCEPT = "accept"
+_ITEM_DECISION_DECLINE = "decline"
 
 
 class ApprovalHandler:
+    """Builds the per-method approval response payload (the ``result`` body
+    of the JSON-RPC reply).
+
+    Under ``approval_policy="never"`` every approval is granted. Any other
+    policy denies — defensive default for future policies that may want
+    stricter behaviour. Permissions requests under "never" return an empty
+    granted profile (the OS-level sandbox is the operative authority).
+    """
+
     def __init__(self, *, approval_policy: str) -> None:
         if not approval_policy:
             raise ValueError("approval_policy must be a non-empty string")
@@ -57,41 +89,60 @@ class ApprovalHandler:
     def approval_policy(self) -> str:
         return self._approval_policy
 
-    def build_response(
-        self, request_payload: dict[str, Any]
-    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
-        approval_id = request_payload.get("approvalId")
-        approved = self._approval_policy == APPROVAL_POLICY_NEVER
+    @property
+    def approves(self) -> bool:
+        return self._approval_policy == APPROVAL_POLICY_NEVER
 
-        response = {
-            "jsonrpc": JSONRPC_VERSION,
-            "method": METHOD_APPROVAL_RESPONSE,
-            "params": {
-                "approvalId": approval_id,
-                "approved": approved,
-            },
-        }
+    def build_result(
+        self, method: str, _params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Return the JSON-RPC ``result`` body for ``method``.
 
-        observability_event_method = (
-            EVENT_APPROVAL_AUTO_APPROVED
-            if approved
-            else EVENT_APPROVAL_DENIED
-        )
-        observability = {
-            "event": observability_event_method,
-            "timestamp": datetime.now(UTC),
-            "payload": dict(request_payload),
-        }
-        return response, observability
+        ``_params`` is the request's ``params`` dict (unused under the
+        current "never" / fall-back-deny policy, but threaded through so
+        future policies can branch on it).
+        """
+        if method in (
+            METHOD_APPLY_PATCH_APPROVAL,
+            METHOD_EXEC_COMMAND_APPROVAL,
+        ):
+            decision = (
+                _REVIEW_DECISION_APPROVED
+                if self.approves
+                else _REVIEW_DECISION_DENIED
+            )
+            return {"decision": decision}
+
+        if method in (
+            METHOD_ITEM_COMMAND_EXECUTION_REQUEST_APPROVAL,
+            METHOD_ITEM_FILE_CHANGE_REQUEST_APPROVAL,
+        ):
+            decision = (
+                _ITEM_DECISION_ACCEPT
+                if self.approves
+                else _ITEM_DECISION_DECLINE
+            )
+            return {"decision": decision}
+
+        if method == METHOD_ITEM_PERMISSIONS_REQUEST_APPROVAL:
+            # PermissionsRequestApprovalResponse: ``permissions`` is the only
+            # required field. An empty GrantedPermissionProfile is valid and
+            # signals "no additional permissions granted" — the OS sandbox
+            # already covers the workspace-write surface we expose.
+            # ``scope`` defaults to "turn" in the schema; omit explicit value.
+            return {"permissions": {}}
+
+        raise ValueError(f"unknown approval method: {method!r}")
 
 
 __all__ = [
+    "APPROVAL_METHODS",
     "APPROVAL_POLICY_NEVER",
-    "EVENT_APPROVAL_AUTO_APPROVED",
-    "EVENT_APPROVAL_DENIED",
-    "EVENT_APPROVAL_REQUEST",
-    "METHOD_APPROVAL_RESPONSE",
+    "METHOD_APPLY_PATCH_APPROVAL",
+    "METHOD_EXEC_COMMAND_APPROVAL",
+    "METHOD_ITEM_COMMAND_EXECUTION_REQUEST_APPROVAL",
+    "METHOD_ITEM_FILE_CHANGE_REQUEST_APPROVAL",
+    "METHOD_ITEM_PERMISSIONS_REQUEST_APPROVAL",
     "SANDBOX_POLICY_WORKSPACE_WRITE",
-    "ApprovalDecision",
     "ApprovalHandler",
 ]

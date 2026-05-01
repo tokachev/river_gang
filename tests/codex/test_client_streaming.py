@@ -8,12 +8,18 @@ from datetime import UTC, datetime
 
 import pytest
 
-from river_gang.codex.client import CodexClient, RuntimeEvent, Session, TurnResult
+from river_gang.codex.client import (
+    METHOD_ITEM_TOOL_CALL,
+    METHOD_TURN_COMPLETED,
+    CodexClient,
+    RuntimeEvent,
+    Session,
+    TurnResult,
+)
 from river_gang.codex.errors import (
     PortExit,
     TurnCancelled,
     TurnFailed,
-    TurnInputRequired,
     TurnTimeout,
 )
 from river_gang.codex.protocol import (
@@ -36,17 +42,43 @@ def _session() -> Session:
 
 
 def _ack(turn_id: str = "tn-1", *, request_id: int = 1) -> dict[str, object]:
-    """Synchronous turn.start ack — JSON-RPC response with id."""
+    """Synchronous turn/start ack — codex 0.125.0+ wraps id under
+    ``result.turn``."""
     return {
         "jsonrpc": "2.0",
         "id": request_id,
-        "result": {"turnId": turn_id},
+        "result": {"turn": {"id": turn_id, "status": "inProgress"}},
     }
 
 
 def _evt(method: str, **params: object) -> dict[str, object]:
     """Notification (no id) carrying ``params``."""
     return {"jsonrpc": "2.0", "method": method, "params": dict(params)}
+
+
+def _turn_completed(
+    *,
+    turn_id: str = "tn-1",
+    status: str = "completed",
+    error_message: str | None = None,
+    extra_turn_fields: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Build a ``turn/completed`` notification (codex 0.125.0+ shape).
+
+    The single notification carries the full Turn object including
+    ``status`` (one of completed/failed/interrupted/inProgress) and an
+    optional ``error`` (TurnError) populated only when status=failed.
+    """
+    turn: dict[str, object] = {
+        "id": turn_id,
+        "status": status,
+        "items": [],
+    }
+    if error_message is not None:
+        turn["error"] = {"message": error_message}
+    if extra_turn_fields:
+        turn.update(extra_turn_fields)
+    return _evt(METHOD_TURN_COMPLETED, threadId="th-1", turn=turn)
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +91,7 @@ async def test_stream_turn_success_returns_turn_result_succeeded() -> None:
     fake.queue(
         _ack(turn_id="tn-1"),
         _evt("notification", text="thinking"),
-        _evt("turn_completed", summary="all done"),
+        _turn_completed(turn_id="tn-1"),
     )
     client = CodexClient(process=fake, codex_app_server_pid=1)
     received: list[RuntimeEvent] = []
@@ -73,10 +105,9 @@ async def test_stream_turn_success_returns_turn_result_succeeded() -> None:
 
     assert isinstance(result, TurnResult)
     assert result.turn_id == "tn-1"
-    assert result.completion_event == "turn_completed"
-    assert result.payload == {"summary": "all done"}
+    assert result.completion_event == METHOD_TURN_COMPLETED
     # Both notifications + completion delivered in order
-    assert [e.event for e in received] == ["notification", "turn_completed"]
+    assert [e.event for e in received] == ["notification", METHOD_TURN_COMPLETED]
 
 
 async def test_stream_turn_propagates_runtime_event_shape() -> None:
@@ -84,7 +115,7 @@ async def test_stream_turn_propagates_runtime_event_shape() -> None:
     fake.queue(
         _ack(turn_id="tn-1"),
         _evt("notification", text="hi"),
-        _evt("turn_completed"),
+        _turn_completed(),
     )
     client = CodexClient(process=fake, codex_app_server_pid=999)
     received: list[RuntimeEvent] = []
@@ -106,7 +137,7 @@ async def test_stream_turn_propagates_runtime_event_shape() -> None:
 
 async def test_stream_turn_writes_first_turn_request_with_prompt() -> None:
     fake = FakeCodexProcess()
-    fake.queue(_ack(turn_id="tn-1"), _evt("turn_completed"))
+    fake.queue(_ack(turn_id="tn-1"), _turn_completed())
     client = CodexClient(process=fake, codex_app_server_pid=1)
 
     await client.stream_turn(
@@ -120,13 +151,14 @@ async def test_stream_turn_writes_first_turn_request_with_prompt() -> None:
     request = fake.written_frames[0]
     assert request["method"] == METHOD_TURN_START
     assert request["params"]["threadId"] == "th-1"
-    assert request["params"]["prompt"] == "full prompt body"
-    assert "guidance" not in request["params"]
+    assert request["params"]["input"] == [
+        {"type": "text", "text": "full prompt body"}
+    ]
 
 
 async def test_stream_turn_continuation_writes_guidance_no_prompt() -> None:
     fake = FakeCodexProcess()
-    fake.queue(_ack(turn_id="tn-2"), _evt("turn_completed"))
+    fake.queue(_ack(turn_id="tn-2"), _turn_completed(turn_id="tn-2"))
     client = CodexClient(process=fake, codex_app_server_pid=1)
 
     await client.stream_turn(
@@ -139,8 +171,9 @@ async def test_stream_turn_continuation_writes_guidance_no_prompt() -> None:
 
     request = fake.written_frames[0]
     assert request["method"] == METHOD_TURN_START
-    assert request["params"]["guidance"] == "please continue"
-    assert "prompt" not in request["params"]
+    assert request["params"]["input"] == [
+        {"type": "text", "text": "please continue"}
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -148,11 +181,14 @@ async def test_stream_turn_continuation_writes_guidance_no_prompt() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_stream_turn_failure_event_raises_turn_failed() -> None:
+async def test_stream_turn_failed_status_raises_turn_failed_with_message() -> None:
+    """Codex 0.125.0+: a single ``turn/completed`` notification with
+    ``status=failed`` carries the error message at ``params.turn.error.message``.
+    """
     fake = FakeCodexProcess()
     fake.queue(
         _ack(),
-        _evt("turn_failed", reason="agent crashed"),
+        _turn_completed(status="failed", error_message="agent crashed"),
     )
     client = CodexClient(process=fake, codex_app_server_pid=1)
 
@@ -166,9 +202,11 @@ async def test_stream_turn_failure_event_raises_turn_failed() -> None:
     assert "agent crashed" in str(exc.value)
 
 
-async def test_stream_turn_ended_with_error_also_raises_turn_failed() -> None:
+async def test_stream_turn_failed_status_without_error_object_still_raises() -> None:
+    """``status=failed`` without an error sub-object still surfaces TurnFailed
+    with a default message — never silently succeed."""
     fake = FakeCodexProcess()
-    fake.queue(_ack(), _evt("turn_ended_with_error", code="x"))
+    fake.queue(_ack(), _turn_completed(status="failed"))
     client = CodexClient(process=fake, codex_app_server_pid=1)
 
     with pytest.raises(TurnFailed):
@@ -180,9 +218,39 @@ async def test_stream_turn_ended_with_error_also_raises_turn_failed() -> None:
         )
 
 
-async def test_stream_turn_cancelled_event_raises_turn_cancelled() -> None:
+async def test_stream_turn_jsonrpc_error_ack_raises_turn_failed() -> None:
+    """A JSON-RPC error response to the streaming ``turn/start`` ack must
+    surface as :class:`TurnFailed` (not :class:`ResponseError`).
+
+    worker.py only catches TurnFailed/TurnCancelled/TurnTimeout/PortExit on
+    the streaming path — a ResponseError leaking out of stream_turn would
+    propagate uncaught and break the typed-exit contract.
+    """
     fake = FakeCodexProcess()
-    fake.queue(_ack(), _evt("turn_cancelled", by="operator"))
+    fake.queue(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {"code": -32000, "message": "bad turn"},
+        }
+    )
+    client = CodexClient(process=fake, codex_app_server_pid=1)
+
+    with pytest.raises(TurnFailed) as exc:
+        await client.stream_turn(
+            session=_session(),
+            prompt="x",
+            on_event=lambda _e: None,
+            turn_timeout_ms=5000,
+        )
+    assert "bad turn" in str(exc.value)
+    assert "-32000" in str(exc.value)
+
+
+async def test_stream_turn_interrupted_status_raises_turn_cancelled() -> None:
+    """``status=interrupted`` (operator/timeout-driven) → TurnCancelled."""
+    fake = FakeCodexProcess()
+    fake.queue(_ack(), _turn_completed(status="interrupted"))
     client = CodexClient(process=fake, codex_app_server_pid=1)
 
     with pytest.raises(TurnCancelled):
@@ -194,19 +262,154 @@ async def test_stream_turn_cancelled_event_raises_turn_cancelled() -> None:
         )
 
 
-async def test_stream_turn_user_input_required_raises_turn_input_required() -> None:
-    """SPED §10.5 high-trust posture: user-input-required = hard failure."""
+async def test_stream_turn_in_progress_status_continues_streaming() -> None:
+    """``status=inProgress`` is a heartbeat — the stream must keep waiting
+    for a terminal status, not return early."""
     fake = FakeCodexProcess()
-    fake.queue(_ack(), _evt("turn_input_required", question="?"))
+    fake.queue(
+        _ack(),
+        _turn_completed(status="inProgress"),
+        _turn_completed(status="completed"),
+    )
+    client = CodexClient(process=fake, codex_app_server_pid=1)
+    received: list[RuntimeEvent] = []
+
+    result = await client.stream_turn(
+        session=_session(),
+        prompt="x",
+        on_event=received.append,
+        turn_timeout_ms=5000,
+    )
+
+    assert isinstance(result, TurnResult)
+    # Both turn/completed events were forwarded to on_event before resolution.
+    assert [e.event for e in received] == [METHOD_TURN_COMPLETED, METHOD_TURN_COMPLETED]
+
+
+async def test_stream_turn_completed_missing_turn_object_raises() -> None:
+    """A ``turn/completed`` without the required ``turn`` object is protocol
+    drift — surfaces TurnFailed instead of silently succeeding."""
+    fake = FakeCodexProcess()
+    fake.queue(
+        _ack(),
+        # Notification missing the ``turn`` object entirely.
+        _evt(METHOD_TURN_COMPLETED, threadId="th-1"),
+    )
     client = CodexClient(process=fake, codex_app_server_pid=1)
 
-    with pytest.raises(TurnInputRequired):
+    with pytest.raises(TurnFailed) as exc:
         await client.stream_turn(
             session=_session(),
             prompt="x",
             on_event=lambda _e: None,
             turn_timeout_ms=5000,
         )
+    assert "missing" in str(exc.value).lower()
+
+
+async def test_stream_turn_completed_unknown_status_raises() -> None:
+    """Unknown ``turn.status`` is protocol drift — surfaces TurnFailed
+    instead of treating as completed (which would mask schema regressions)."""
+    fake = FakeCodexProcess()
+    fake.queue(_ack(), _turn_completed(status="bogus_status"))
+    client = CodexClient(process=fake, codex_app_server_pid=1)
+
+    with pytest.raises(TurnFailed) as exc:
+        await client.stream_turn(
+            session=_session(),
+            prompt="x",
+            on_event=lambda _e: None,
+            turn_timeout_ms=5000,
+        )
+    assert "unknown status" in str(exc.value).lower()
+    assert "bogus_status" in str(exc.value)
+
+
+async def test_stream_turn_top_level_error_notification_raises_turn_failed() -> None:
+    """A top-level ``error`` notification with ``willRetry=False`` is a
+    session-level fatal — surfaces TurnFailed carrying the error message."""
+    fake = FakeCodexProcess()
+    fake.queue(
+        _ack(),
+        _evt(
+            "error",
+            threadId="th-1",
+            turnId="tn-1",
+            willRetry=False,
+            error={"message": "session blew up"},
+        ),
+    )
+    client = CodexClient(process=fake, codex_app_server_pid=1)
+
+    with pytest.raises(TurnFailed) as exc:
+        await client.stream_turn(
+            session=_session(),
+            prompt="x",
+            on_event=lambda _e: None,
+            turn_timeout_ms=5000,
+        )
+    assert "session blew up" in str(exc.value)
+
+
+async def test_stream_turn_top_level_error_with_will_retry_true_continues() -> None:
+    """``ErrorNotification.willRetry=true`` means codex intends to retry the
+    turn itself. Aborting on every error frame would race the retry and
+    surface a spurious failure — surface as a notification beat (delivered
+    via on_event) and keep streaming until codex emits the next
+    ``turn/completed``."""
+    fake = FakeCodexProcess()
+    fake.queue(
+        _ack(),
+        _evt(
+            "error",
+            threadId="th-1",
+            turnId="tn-1",
+            willRetry=True,
+            error={"message": "transient — retrying"},
+        ),
+        # Codex retries and ultimately succeeds.
+        _turn_completed(turn_id="tn-1", status="completed"),
+    )
+    client = CodexClient(process=fake, codex_app_server_pid=1)
+    received: list[RuntimeEvent] = []
+
+    result = await client.stream_turn(
+        session=_session(),
+        prompt="x",
+        on_event=received.append,
+        turn_timeout_ms=5000,
+    )
+    assert isinstance(result, TurnResult)
+    # The error notification was still delivered to on_event (audit trail).
+    assert any(e.event == "error" for e in received)
+
+
+async def test_stream_turn_top_level_error_with_will_retry_absent_fails_closed() -> None:
+    """If ``willRetry`` is absent (schema requires it but defensive against
+    drift), fail closed: treat as a non-retryable error and raise
+    TurnFailed. Silently continuing on a malformed error frame would mask
+    schema regressions in production."""
+    fake = FakeCodexProcess()
+    fake.queue(
+        _ack(),
+        _evt(
+            "error",
+            threadId="th-1",
+            turnId="tn-1",
+            error={"message": "no willRetry field"},
+            # NOTE: no willRetry key.
+        ),
+    )
+    client = CodexClient(process=fake, codex_app_server_pid=1)
+
+    with pytest.raises(TurnFailed) as exc:
+        await client.stream_turn(
+            session=_session(),
+            prompt="x",
+            on_event=lambda _e: None,
+            turn_timeout_ms=5000,
+        )
+    assert "no willRetry field" in str(exc.value)
 
 
 async def test_stream_turn_subprocess_exit_during_stream_raises_port_exit() -> None:
@@ -261,9 +464,9 @@ async def test_stream_turn_continuation_after_success_reuses_session() -> None:
     # Two complete turn cycles back-to-back.
     fake.queue(
         _ack(turn_id="tn-1", request_id=1),
-        _evt("turn_completed", n=1),
+        _turn_completed(turn_id="tn-1"),
         _ack(turn_id="tn-2", request_id=2),
-        _evt("turn_completed", n=2),
+        _turn_completed(turn_id="tn-2"),
     )
     client = CodexClient(process=fake, codex_app_server_pid=1)
     sess = _session()
@@ -289,81 +492,69 @@ async def test_stream_turn_continuation_after_success_reuses_session() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_stream_turn_unsupported_tool_call_writes_failure_and_continues() -> None:
-    """SPED §10.5: unknown dynamic tool returns a tool failure response,
-    session does NOT crash."""
+def _tool_call_request(
+    *,
+    request_id: int,
+    tool: str,
+    arguments: object,
+    call_id: str = "c-1",
+) -> dict[str, object]:
+    """Build a codex 0.125.0+ ``item/tool/call`` server-request frame."""
+    return {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": METHOD_ITEM_TOOL_CALL,
+        "params": {
+            "tool": tool,
+            "arguments": arguments,
+            "callId": call_id,
+            "threadId": "th-1",
+            "turnId": "tn-1",
+        },
+    }
+
+
+async def test_stream_turn_unsupported_tool_call_replies_with_success_false() -> None:
+    """SPED §10.5: unknown dynamic tool returns a DynamicToolCallResponse
+    with ``success=false`` and an ``unsupported_tool: ...`` content item;
+    the session does NOT crash and codex unblocks immediately."""
     fake = FakeCodexProcess()
     fake.queue(
         _ack(turn_id="tn-1"),
-        _evt(
-            "tool_call",
-            callId="call-7",
-            toolName="bogus_tool",
+        _tool_call_request(
+            request_id=42,
+            tool="bogus_tool",
             arguments={"x": 1},
+            call_id="call-7",
         ),
-        _evt("turn_completed"),
+        _turn_completed(),
     )
     client = CodexClient(process=fake, codex_app_server_pid=1)
-    received: list[RuntimeEvent] = []
 
     result = await client.stream_turn(
         session=_session(),
         prompt="x",
-        on_event=received.append,
+        on_event=lambda _e: None,
         turn_timeout_ms=5000,
     )
 
     assert isinstance(result, TurnResult)
-    # We wrote: turn.start request + a tool_call_response failure frame.
-    methods = [f["method"] for f in fake.written_frames]
-    assert "tool_call_response" in methods
-    failure_frame = next(
-        f for f in fake.written_frames if f["method"] == "tool_call_response"
-    )
-    assert failure_frame["params"]["callId"] == "call-7"
-    assert failure_frame["params"]["ok"] is False
-    assert "unsupported_tool" in failure_frame["params"]["error"]
-    # The unsupported_tool_call event was forwarded to on_event for observability.
-    assert any(e.event == "unsupported_tool_call" for e in received)
-
-
-async def test_stream_turn_unsupported_tool_call_without_call_id_still_replies() -> None:
-    """An unsupported tool_call with NO ``callId`` must still get a
-    ``tool_call_response`` so the agent's pending-tool-call entry can
-    unblock — otherwise the session hangs forever."""
-    fake = FakeCodexProcess()
-    fake.queue(
-        _ack(turn_id="tn-1"),
-        # Note: intentionally no callId in params
-        _evt("tool_call", toolName="bogus_tool", arguments={"x": 1}),
-        _evt("turn_completed"),
-    )
-    client = CodexClient(process=fake, codex_app_server_pid=1)
-    received: list[RuntimeEvent] = []
-
-    result = await client.stream_turn(
-        session=_session(),
-        prompt="x",
-        on_event=received.append,
-        turn_timeout_ms=5000,
-    )
-
-    assert isinstance(result, TurnResult)
-    response_frames = [
-        f for f in fake.written_frames if f["method"] == "tool_call_response"
+    replies = [
+        f
+        for f in fake.written_frames
+        if f.get("id") == 42 and "method" not in f
     ]
-    assert len(response_frames) == 1
-    params = response_frames[0]["params"]
-    # callId surfaces as None when the original event omitted it.
-    assert params["callId"] is None
-    assert params["ok"] is False
-    assert "unsupported_tool" in params["error"]
+    assert len(replies) == 1
+    reply = replies[0]
+    assert "result" in reply
+    assert reply["result"]["success"] is False
+    assert "unsupported_tool" in reply["result"]["contentItems"][0]["text"]
 
 
-async def test_stream_turn_wired_linear_tool_does_not_emit_unsupported_failure() -> None:
-    """When ``linear_graphql_tool`` is wired (Task 24), ``tool_call`` for
-    ``linear_graphql`` is dispatched to the tool — the response frame is
-    a SUCCESS shape (``ok=True``), NOT an ``unsupported_tool`` failure.
+async def test_stream_turn_wired_linear_tool_replies_with_success() -> None:
+    """When ``linear_graphql_tool`` is wired, an ``item/tool/call`` request
+    for ``linear_graphql`` is dispatched to the tool — the JSON-RPC reply is
+    a SUCCESS shape (``result.success=True``), NOT an unknown-tool error.
     """
     from river_gang.tools.linear_graphql import ToolResult
 
@@ -376,8 +567,13 @@ async def test_stream_turn_wired_linear_tool_does_not_emit_unsupported_failure()
     fake = FakeCodexProcess()
     fake.queue(
         _ack(),
-        _evt("tool_call", callId="c1", toolName="linear_graphql", arguments={}),
-        _evt("turn_completed"),
+        _tool_call_request(
+            request_id=51,
+            tool="linear_graphql",
+            arguments={},
+            call_id="c1",
+        ),
+        _turn_completed(),
     )
     client = CodexClient(
         process=fake,
@@ -391,12 +587,16 @@ async def test_stream_turn_wired_linear_tool_does_not_emit_unsupported_failure()
         turn_timeout_ms=5000,
     )
 
-    response = next(
-        f for f in fake.written_frames if f.get("method") == "tool_call_response"
-    )
-    assert response["params"]["ok"] is True
-    assert response["params"].get("error") is None
-    assert "unsupported_tool" not in str(response["params"])
+    replies = [
+        f
+        for f in fake.written_frames
+        if f.get("id") == 51 and "method" not in f
+    ]
+    assert len(replies) == 1
+    reply = replies[0]
+    assert "result" in reply
+    assert reply["result"]["success"] is True
+    assert isinstance(reply["result"]["contentItems"], list)
 
 
 # ---------------------------------------------------------------------------
@@ -404,17 +604,17 @@ async def test_stream_turn_wired_linear_tool_does_not_emit_unsupported_failure()
 # ---------------------------------------------------------------------------
 
 
-async def test_stop_session_writes_shutdown_notification() -> None:
+async def test_stop_session_does_not_write_shutdown_notification() -> None:
+    """ClientNotification (codex 0.125.0+ schema) only allows ``initialized``;
+    no ``shutdown`` notification exists. ``stop_session`` relies on OS-level
+    termination via ``aclose`` and MUST NOT emit a non-schema frame."""
     fake = FakeCodexProcess()
     client = CodexClient(process=fake, codex_app_server_pid=1)
 
     await client.stop_session(_session(), graceful_timeout_s=1.0)
 
-    methods = [f["method"] for f in fake.written_frames]
-    assert "shutdown" in methods
-    shutdown_frame = next(f for f in fake.written_frames if f["method"] == "shutdown")
-    # shutdown is a notification — no id in the JSON-RPC envelope
-    assert "id" not in shutdown_frame
+    methods = [f.get("method") for f in fake.written_frames]
+    assert "shutdown" not in methods
     assert fake.closed is True
 
 
@@ -489,7 +689,10 @@ async def test_stream_turn_response_includes_completion_payload() -> None:
     fake = FakeCodexProcess()
     fake.queue(
         _ack(turn_id="tn-1"),
-        _evt("turn_completed", summary="ok", duration_ms=1234),
+        _turn_completed(
+            turn_id="tn-1",
+            extra_turn_fields={"durationMs": 1234},
+        ),
     )
     client = CodexClient(process=fake, codex_app_server_pid=1)
     result = await client.stream_turn(
@@ -498,7 +701,11 @@ async def test_stream_turn_response_includes_completion_payload() -> None:
         on_event=lambda _e: None,
         turn_timeout_ms=5000,
     )
-    assert result.payload == {"summary": "ok", "duration_ms": 1234}
+    # turn/completed payload carries the full Turn object; durationMs is
+    # threaded through ``params.turn``.
+    assert result.payload["turn"]["id"] == "tn-1"
+    assert result.payload["turn"]["status"] == "completed"
+    assert result.payload["turn"]["durationMs"] == 1234
 
 
 # ---------------------------------------------------------------------------
@@ -528,4 +735,4 @@ def test_turn_result_succeeded_factory() -> None:
     assert isinstance(result, TurnResult)
     assert result.turn_id == "tn-1"
     assert result.payload == {"k": 1}
-    assert result.completion_event == "turn_completed"
+    assert result.completion_event == METHOD_TURN_COMPLETED

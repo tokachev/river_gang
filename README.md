@@ -7,7 +7,9 @@ state. Implements **Symphony Service Specification v1** (`SPED.md`)
 plus two OPTIONAL extensions: an HTTP server and the `linear_graphql`
 client-side tool.
 
-Requires **Python 3.11+**.
+Requires **Python 3.11+** and **codex >= 0.125.0** (the app-server
+protocol used by river-gang switched its method namespace and request
+shapes in 0.125.0; older codex builds are not compatible).
 
 ## Install
 

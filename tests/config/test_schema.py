@@ -41,6 +41,8 @@ def test_tracker_config_fields() -> None:
         project_slug="proj",
         active_states=("Todo", "In Progress"),
         terminal_states=("Done",),
+        start_state="In Progress",
+        success_state="In Review",
     )
     assert cfg.kind == "linear"
     assert cfg.endpoint == "https://api.linear.app/graphql"
@@ -48,6 +50,8 @@ def test_tracker_config_fields() -> None:
     assert cfg.project_slug == "proj"
     assert cfg.active_states == ("Todo", "In Progress")
     assert cfg.terminal_states == ("Done",)
+    assert cfg.start_state == "In Progress"
+    assert cfg.success_state == "In Review"
 
 
 def test_polling_config_fields() -> None:
@@ -106,6 +110,8 @@ def test_effective_config_composes_subconfigs() -> None:
         project_slug=None,
         active_states=(),
         terminal_states=(),
+        start_state=None,
+        success_state=None,
     )
     polling = PollingConfig(interval_ms=30000)
     workspace = WorkspaceConfig(root="/tmp/ws")
@@ -157,6 +163,8 @@ def test_tracker_active_states_immutable() -> None:
         project_slug=None,
         active_states=("Todo",),
         terminal_states=("Done",),
+        start_state=None,
+        success_state=None,
     )
     # active_states must be a tuple (immutable). Fail loud if somebody changes
     # it to a list — mutability would let consumers patch shared default state.

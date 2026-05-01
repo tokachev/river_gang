@@ -9,6 +9,8 @@ import pytest
 
 from river_gang.config.defaults import (
     DEFAULT_ACTIVE_STATES,
+    DEFAULT_START_STATE,
+    DEFAULT_SUCCESS_STATE,
     DEFAULT_TERMINAL_STATES,
     ConfigCoercionError,
     apply_defaults,
@@ -27,6 +29,8 @@ def test_apply_defaults_empty_dict_returns_full_defaults() -> None:
     assert cfg.tracker.project_slug is None
     assert cfg.tracker.active_states == DEFAULT_ACTIVE_STATES
     assert cfg.tracker.terminal_states == DEFAULT_TERMINAL_STATES
+    assert cfg.tracker.start_state == DEFAULT_START_STATE
+    assert cfg.tracker.success_state == DEFAULT_SUCCESS_STATE
 
     # polling defaults
     assert cfg.polling.interval_ms == 30000
@@ -237,6 +241,35 @@ def test_active_states_non_list_raises_coercion_error() -> None:
 def test_active_states_non_string_entries_raise_coercion_error() -> None:
     with pytest.raises(ConfigCoercionError):
         apply_defaults({"tracker": {"active_states": ["Todo", 5]}})
+
+
+def test_start_and_success_state_overrides() -> None:
+    cfg = apply_defaults(
+        {
+            "tracker": {
+                "start_state": "Doing",
+                "success_state": "Needs Review",
+            }
+        }
+    )
+    assert cfg.tracker.start_state == "Doing"
+    assert cfg.tracker.success_state == "Needs Review"
+
+
+def test_start_and_success_state_explicit_null_disables_transition() -> None:
+    cfg = apply_defaults(
+        {"tracker": {"start_state": None, "success_state": None}}
+    )
+    assert cfg.tracker.start_state is None
+    assert cfg.tracker.success_state is None
+
+
+def test_start_and_success_state_empty_string_disables_transition() -> None:
+    cfg = apply_defaults(
+        {"tracker": {"start_state": "", "success_state": ""}}
+    )
+    assert cfg.tracker.start_state is None
+    assert cfg.tracker.success_state is None
 
 
 def test_apply_defaults_does_not_mutate_input() -> None:
