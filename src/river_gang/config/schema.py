@@ -18,6 +18,8 @@ class TrackerConfig:
     project_slug: str | None
     active_states: tuple[str, ...]
     terminal_states: tuple[str, ...]
+    start_state: str | None
+    success_state: str | None
 
 
 @dataclass(frozen=True)

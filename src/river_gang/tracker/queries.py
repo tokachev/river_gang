@@ -86,6 +86,50 @@ query StateRefresh($issueIds: [ID!]!, $first: Int!, $after: String) {
 """.strip()
 
 
+# Issue → team workflow states lookup (Task: orchestrator-side transitions).
+# Used by :meth:`LinearClient.transition_state` to resolve a workflow state
+# *name* (e.g. ``"In Review"``) into the ``stateId`` Linear's ``issueUpdate``
+# mutation requires. Returned ``team.id`` is the cache key — every issue on
+# the same team shares a workflow state set.
+STATES_FOR_ISSUE_QUERY: str = """
+query StatesForIssue($id: String!) {
+  issue(id: $id) {
+    team {
+      id
+      states {
+        nodes {
+          id
+          name
+        }
+      }
+    }
+  }
+}
+""".strip()
+
+
+# Issue state transition mutation. ``stateId`` MUST be a workflow state id
+# resolved via ``STATES_FOR_ISSUE_QUERY`` — Linear rejects names directly.
+ISSUE_UPDATE_STATE_MUTATION: str = """
+mutation IssueUpdateState($id: String!, $stateId: String!) {
+  issueUpdate(id: $id, input: { stateId: $stateId }) {
+    success
+  }
+}
+""".strip()
+
+
+# Comment creation mutation used to surface failure context on the issue
+# before the ``success_state`` transition lands.
+COMMENT_CREATE_MUTATION: str = """
+mutation CommentCreate($issueId: String!, $body: String!) {
+  commentCreate(input: { issueId: $issueId, body: $body }) {
+    success
+  }
+}
+""".strip()
+
+
 # Terminal fetch: same projection as Candidates (full §4.1.1 fields) but
 # filters by an explicit list of state names. Used by startup terminal
 # workspace cleanup (§8.6).

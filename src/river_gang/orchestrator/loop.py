@@ -137,6 +137,12 @@ class _TrackerLike(Protocol):
         self, issue_ids: list[str]
     ) -> list[Issue]: ...
 
+    async def transition_state(
+        self, issue_id: str, state_name: str
+    ) -> None: ...
+
+    async def add_comment(self, issue_id: str, body: str) -> None: ...
+
 
 class Orchestrator:
     """Main orchestrator class — owns mailbox, runs dispatcher, schedules ticks."""

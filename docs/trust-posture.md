@@ -31,8 +31,15 @@ river-gang configures the Codex app-server with
   `ApprovalHandler` and the session continues without operator
   intervention.
 - File-change approval requests are auto-approved.
-- The auto-approval is recorded as an `approval_auto_approved`
-  observability event so audit logs reflect the decision.
+- Audit pattern: codex 0.125.0+ promotes approvals from notifications
+  to JSON-RPC server requests (`applyPatchApproval`,
+  `execCommandApproval`, `item/commandExecution/requestApproval`,
+  `item/fileChange/requestApproval`,
+  `item/permissions/requestApproval`). Each inbound request frame and
+  the matching outbound `{id, result: {decision: ...}}` (or
+  `{permissions: {}}`) reply are visible in the structured logs at
+  DEBUG level — operators capturing the JSON-RPC stream see both halves
+  of every approval round-trip.
 
 **Rationale**: river-gang is a daemon-driven unattended workflow.
 Pausing for a human operator on every tool call would dominate latency
@@ -63,12 +70,21 @@ to the orchestrator. This is the §15.2 "Mandatory" baseline — see
 [`docs/conformance.md`](conformance.md) §17.2 row "Agent launch uses
 the per-issue workspace path as cwd and rejects out-of-root paths".
 
-## User-input-required: hard failure
+## User-input-required: never block
 
-When the Codex app-server emits a `turn_input_required` event, the
-worker raises `TurnInputRequired` and the run **fails immediately**
-with `reason="turn_input_required"`. The daemon does not prompt, does
-not surface the request to a human, and does not wait.
+Codex 0.125.0+ promoted the legacy `turn_input_required` notification
+into the `item/tool/requestUserInput` JSON-RPC server request. When
+codex sends one, river-gang's handler immediately replies with an
+empty `ToolRequestUserInputResponse` (`{answers: {}}`) — schema-valid
+"no answers provided" — so codex unblocks without waiting on a human.
+The daemon does not prompt, does not surface the request to a human,
+and does not block on input.
+
+The downstream effect is implementation-defined by codex: it typically
+proceeds without the requested input or raises its own failure on the
+next turn event. river-gang surfaces the inbound request frame and
+outbound `{answers: {}}` reply in DEBUG-level structured logs for
+audit.
 
 **Rationale**: A daemon cannot reliably reach a human. Anything that
 needs human judgement should never have entered the queue —
@@ -76,7 +92,7 @@ WORKFLOW.md authors are responsible for shaping prompts so the agent
 either solves the task autonomously or fails fast.
 
 This matches the §10.5 example "high-trust behavior" — treating
-user-input-required turns as hard failure — verbatim.
+user-input-required turns as never-block — verbatim.
 
 ## Hooks run with daemon privilege
 
@@ -172,9 +188,28 @@ data, internet-exposed dashboard, etc.) SHOULD layer the following:
 - **Secret rotation cadence**: rotate `LINEAR_API_KEY` and any other
   `$VAR`-resolved secrets per organization policy; restart the daemon
   after rotation.
-- **Tool-call audit**: capture all `tool_call` and `tool_call_response`
-  observability events from the structured logs and ship them to a
-  tamper-evident store. river-gang emits these per turn (§13).
+- **Tool-call audit**: codex 0.125.0+ promotes tool calls to JSON-RPC
+  request/response — capture each inbound `item/tool/call` server
+  request and the matching outbound `{id, result: {success,
+  contentItems}}` reply from the structured logs and ship them to a
+  tamper-evident store.
+- **`linear_graphql` advertisement gap**: the codex 0.125.0 JSON
+  schema defines `DynamicToolSpec` but does not reference it from
+  `InitializeParams`, `ThreadStartParams`, or `TurnStartParams`. There
+  is no wire mechanism for river-gang to advertise its client-side
+  `linear_graphql` tool during the handshake. The `item/tool/call`
+  handler is wired and fully exercised by the unit/conformance tests
+  (the dispatcher correctly routes calls codex sends), but codex will
+  not issue an `item/tool/call` request for this tool unless it has
+  been registered externally (e.g. via an MCP server configured by the
+  operator). Linear ticket state transitions and failure-context
+  comments are now driven from the orchestrator side
+  (`LinearClient.transition_state` / `add_comment`, called by the
+  per-issue worker on entry and exit) so the dormant tool is no
+  longer required for the §16.5 lifecycle. Operators who still want
+  the agent to issue ad-hoc Linear queries can register the tool via
+  MCP; absent that, the handler stays dormant by design and a debug
+  log line surfaces the wiring at session start.
 - **Token consumption monitoring**: subscribe to `codex_totals` and
   `rate_limits` from `GET /api/v1/state` to detect runaway agent loops
   and rate-limit exhaustion before they affect production cost or

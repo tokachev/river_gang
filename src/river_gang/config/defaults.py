@@ -46,6 +46,11 @@ DEFAULT_TERMINAL_STATES: tuple[str, ...] = (
     "Duplicate",
     "Done",
 )
+# Workflow state names used by orchestrator-side ticket transitions. Set
+# to ``None`` in workflow config to disable the corresponding transition
+# (start-on-dispatch / success-on-exit).
+DEFAULT_START_STATE: str | None = "In Progress"
+DEFAULT_SUCCESS_STATE: str | None = "In Review"
 DEFAULT_POLLING_INTERVAL_MS = 30000
 DEFAULT_HOOKS_TIMEOUT_MS = 60000
 DEFAULT_MAX_CONCURRENT_AGENTS = 10
@@ -170,7 +175,30 @@ def _build_tracker(raw: dict[str, Any]) -> TrackerConfig:
             section.get("terminal_states", list(DEFAULT_TERMINAL_STATES)),
             path="tracker.terminal_states",
         ),
+        start_state=_coerce_state_name(
+            section.get("start_state", DEFAULT_START_STATE),
+            path="tracker.start_state",
+        ),
+        success_state=_coerce_state_name(
+            section.get("success_state", DEFAULT_SUCCESS_STATE),
+            path="tracker.success_state",
+        ),
     )
+
+
+def _coerce_state_name(value: Any, *, path: str) -> str | None:
+    """Like ``_coerce_optional_str`` but treats empty strings as ``None``.
+
+    Empty strings would otherwise survive coercion and cause the orchestrator
+    to issue an ``issueUpdate`` against an unresolvable workflow state name —
+    explicit ``""`` in the workflow front-matter is the operator's signal
+    that the corresponding transition should be skipped, identical to a YAML
+    ``null``.
+    """
+    coerced = _coerce_optional_str(value, path=path)
+    if coerced is None or coerced == "":
+        return None
+    return coerced
 
 
 def _build_polling(raw: dict[str, Any]) -> PollingConfig:

@@ -45,9 +45,17 @@ class FakeTracker:
             k: list(v) for k, v in (terminal_by_state or {}).items()
         }
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        # Mutation observation surfaces. Tests assert ordering against these
+        # lists and on the ``calls`` log; both are populated even when the
+        # one-shot failure injection fires (so call-ordering invariants
+        # survive the injection).
+        self.transitions: list[tuple[str, str]] = []
+        self.comments: list[tuple[str, str]] = []
         self._next_candidates_error: LinearError | None = None
         self._next_state_refresh_error: LinearError | None = None
         self._next_terminal_error: LinearError | None = None
+        self._next_transition_error: LinearError | None = None
+        self._next_comment_error: LinearError | None = None
 
     # ------------------------------------------------------------------
     # Configuration mutators
@@ -72,6 +80,12 @@ class FakeTracker:
 
     def fail_next_terminal(self, error: LinearError) -> None:
         self._next_terminal_error = error
+
+    def fail_next_transition(self, error: BaseException) -> None:
+        self._next_transition_error = error  # type: ignore[assignment]
+
+    def fail_next_comment(self, error: BaseException) -> None:
+        self._next_comment_error = error  # type: ignore[assignment]
 
     # ------------------------------------------------------------------
     # LinearClient surface
@@ -111,6 +125,31 @@ class FakeTracker:
                 continue
             results.append(_minimal_refresh_issue(issue_id, new_state))
         return results
+
+    async def transition_state(
+        self, issue_id: str, state_name: str
+    ) -> None:
+        self.calls.append(
+            (
+                "transition_state",
+                {"issue_id": issue_id, "state_name": state_name},
+            )
+        )
+        self.transitions.append((issue_id, state_name))
+        if self._next_transition_error is not None:
+            err = self._next_transition_error
+            self._next_transition_error = None
+            raise err
+
+    async def add_comment(self, issue_id: str, body: str) -> None:
+        self.calls.append(
+            ("add_comment", {"issue_id": issue_id, "body": body})
+        )
+        self.comments.append((issue_id, body))
+        if self._next_comment_error is not None:
+            err = self._next_comment_error
+            self._next_comment_error = None
+            raise err
 
     async def fetch_issues_by_states(
         self, state_names: list[str]

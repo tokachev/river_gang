@@ -448,18 +448,16 @@ class CodexClient:
         # field. The ``item/tool/call`` handler is wired locally (we reply
         # to whatever codex sends) but codex won't issue ``item/tool/call``
         # for ``linear_graphql`` unless the tool has been registered via an
-        # out-of-band path (e.g. an MCP server). Surface this gap loudly at
-        # session start when a linear_graphql tool was wired — silent
-        # registration would let operators believe the tool is reachable
-        # when it isn't.
+        # out-of-band path (e.g. an MCP server). Mention it at debug level
+        # for operator visibility — Linear ticket transitions are now driven
+        # from the orchestrator side (``LinearClient.transition_state`` /
+        # ``add_comment``) so the dormant tool is no longer load-bearing.
         if self._linear_graphql_tool is not None:
-            logger.warning(
+            logger.debug(
                 "linear_graphql tool wired locally but codex 0.125.0 has no "
-                "wire path to advertise client-side tools (DynamicToolSpec "
-                "is defined but unreferenced on InitializeParams / "
-                "ThreadStartParams / TurnStartParams). The item/tool/call "
-                "handler is dormant unless codex is configured externally "
-                "(MCP-style registration) to know about this tool."
+                "wire path for client-side tool advertisement. Handler is "
+                "dormant unless codex is configured externally (MCP). State "
+                "transitions are driven by the orchestrator instead."
             )
 
         await self._round_trip(
