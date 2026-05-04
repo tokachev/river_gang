@@ -48,6 +48,7 @@ from river_gang.orchestrator.clarification import (
     ClarificationGate,
     ClarificationWaitEntry,
     NoopClarificationGate,
+    fingerprint_clarification_inputs,
     fingerprint_questions,
     format_clarification_comment,
     next_clarification_poll_at,
@@ -299,13 +300,22 @@ class Orchestrator:
             return False
 
         seen_comment_ids = non_clarification_comment_ids(comments)
-        if waiting is not None and seen_comment_ids <= waiting.last_seen_comment_ids:
+        input_fingerprint = fingerprint_clarification_inputs(issue, comments)
+        if waiting is not None:
+            if waiting.last_input_fingerprint is not None:
+                no_new_input = input_fingerprint == waiting.last_input_fingerprint
+            else:
+                no_new_input = seen_comment_ids <= waiting.last_seen_comment_ids
+        else:
+            no_new_input = False
+        if waiting is not None and no_new_input:
             self.state.clarification_waiting[issue.id] = ClarificationWaitEntry(
                 issue_id=waiting.issue_id,
                 identifier=waiting.identifier,
                 last_seen_comment_ids=waiting.last_seen_comment_ids,
                 last_question_fingerprint=waiting.last_question_fingerprint,
                 next_poll_at=next_clarification_poll_at(now),
+                last_input_fingerprint=waiting.last_input_fingerprint,
             )
             return False
 
@@ -351,6 +361,7 @@ class Orchestrator:
             last_seen_comment_ids=seen_comment_ids,
             last_question_fingerprint=question_fingerprint,
             next_poll_at=next_clarification_poll_at(now),
+            last_input_fingerprint=input_fingerprint,
         )
         return False
 

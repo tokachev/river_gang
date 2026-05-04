@@ -13,6 +13,8 @@ from river_gang.orchestrator.clarification import (
     CLARIFICATION_COMMENT_MARKER,
     ClarificationDecision,
     ClarificationWaitEntry,
+    fingerprint_clarification_inputs,
+    parse_clarification_decision_payload,
 )
 from river_gang.orchestrator.loop import Orchestrator
 from river_gang.orchestrator.mailbox import Mailbox
@@ -36,7 +38,12 @@ class FakeClarificationGate:
         return self.decisions.pop(0)
 
 
-def _issue(*, id: str = "issue-1", description: str | None = "Build the feature") -> Issue:
+def _issue(
+    *,
+    id: str = "issue-1",
+    description: str | None = "Build the feature",
+    updated_at: datetime | None = None,
+) -> Issue:
     return Issue(
         id=id,
         identifier="TES-1",
@@ -49,16 +56,16 @@ def _issue(*, id: str = "issue-1", description: str | None = "Build the feature"
         labels=(),
         blocked_by=(),
         created_at=datetime(2026, 5, 4, tzinfo=UTC),
-        updated_at=None,
+        updated_at=updated_at,
     )
 
 
-def _comment(id: str, body: str) -> Comment:
+def _comment(id: str, body: str, *, updated_at: datetime | None = None) -> Comment:
     return Comment(
         id=id,
         body=body,
         created_at=datetime(2026, 5, 4, tzinfo=UTC),
-        updated_at=None,
+        updated_at=updated_at,
         user_id="user-1",
         user_name="Artem",
     )
@@ -211,6 +218,90 @@ async def test_new_comment_after_wait_reanalyzes_and_dispatches(
     assert issue.id not in orch.state.clarification_waiting
     assert len(gate.calls) == 1
     assert gate.calls[0]["comments"][-1].id == "human-answer"
+    await orch.shutdown_workers()
+    orch.cancel_next_tick()
+
+
+def test_string_false_decision_payload_fails_closed() -> None:
+    decision = parse_clarification_decision_payload(
+        {"message": '{"sufficient": "false", "questions": []}'}
+    )
+
+    assert decision.sufficient is False
+
+
+async def test_edited_comment_after_wait_reanalyzes_and_dispatches(
+    tmp_path: Path,
+) -> None:
+    issue = _issue()
+    old_comments = (_comment("human-answer", "Still not enough detail"),)
+    state = OrchestratorState(poll_interval_ms=30_000, max_concurrent_agents=1)
+    state.clarification_waiting[issue.id] = ClarificationWaitEntry(
+        issue_id=issue.id,
+        identifier=issue.identifier,
+        last_seen_comment_ids=frozenset({"human-answer"}),
+        last_question_fingerprint="abc",
+        next_poll_at=datetime(2026, 5, 4, 11, 59, tzinfo=UTC),
+        last_input_fingerprint=fingerprint_clarification_inputs(issue, old_comments),
+    )
+    tracker = FakeTracker(
+        candidates=[issue],
+        comments_by_issue={
+            issue.id: [
+                _comment(
+                    "human-answer",
+                    "Final result and edge cases are now fully specified.",
+                    updated_at=datetime(2026, 5, 4, 12, 1, tzinfo=UTC),
+                )
+            ]
+        },
+    )
+    gate = FakeClarificationGate(
+        decisions=[ClarificationDecision(sufficient=True)], calls=[]
+    )
+    orch = _make_orchestrator(
+        tmp_path=tmp_path, tracker=tracker, gate=gate, state=state
+    )
+
+    await orch.on_tick()
+
+    assert set(orch.state.running) == {issue.id}
+    assert len(gate.calls) == 1
+    assert gate.calls[0]["comments"][0].body.startswith("Final result")
+    await orch.shutdown_workers()
+    orch.cancel_next_tick()
+
+
+async def test_updated_issue_text_after_wait_reanalyzes_and_dispatches(
+    tmp_path: Path,
+) -> None:
+    old_issue = _issue(description="Do the thing")
+    new_issue = _issue(
+        description="Do the thing and handle empty, malformed, and duplicate inputs",
+        updated_at=datetime(2026, 5, 4, 12, 1, tzinfo=UTC),
+    )
+    state = OrchestratorState(poll_interval_ms=30_000, max_concurrent_agents=1)
+    state.clarification_waiting[new_issue.id] = ClarificationWaitEntry(
+        issue_id=new_issue.id,
+        identifier=new_issue.identifier,
+        last_seen_comment_ids=frozenset(),
+        last_question_fingerprint="abc",
+        next_poll_at=datetime(2026, 5, 4, 11, 59, tzinfo=UTC),
+        last_input_fingerprint=fingerprint_clarification_inputs(old_issue, ()),
+    )
+    tracker = FakeTracker(candidates=[new_issue], comments_by_issue={new_issue.id: []})
+    gate = FakeClarificationGate(
+        decisions=[ClarificationDecision(sufficient=True)], calls=[]
+    )
+    orch = _make_orchestrator(
+        tmp_path=tmp_path, tracker=tracker, gate=gate, state=state
+    )
+
+    await orch.on_tick()
+
+    assert set(orch.state.running) == {new_issue.id}
+    assert len(gate.calls) == 1
+    assert "malformed" in gate.calls[0]["issue"].description
     await orch.shutdown_workers()
     orch.cancel_next_tick()
 

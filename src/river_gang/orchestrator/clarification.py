@@ -36,6 +36,7 @@ class ClarificationWaitEntry:
     last_seen_comment_ids: frozenset[str]
     last_question_fingerprint: str | None
     next_poll_at: datetime
+    last_input_fingerprint: str | None = None
 
 
 class ClarificationGate(Protocol):
@@ -180,7 +181,7 @@ def parse_clarification_decision_payload(payload: dict[str, Any]) -> Clarificati
             )
         data = json.loads(match.group(0))
 
-    sufficient = bool(data.get("sufficient")) if isinstance(data, dict) else False
+    sufficient = data.get("sufficient") is True if isinstance(data, dict) else False
     raw_questions = data.get("questions") if isinstance(data, dict) else None
     questions: tuple[str, ...] = ()
     if isinstance(raw_questions, list):
@@ -199,6 +200,36 @@ def is_clarification_comment(comment: Comment) -> bool:
 
 def non_clarification_comment_ids(comments: tuple[Comment, ...]) -> frozenset[str]:
     return frozenset(c.id for c in comments if not is_clarification_comment(c))
+
+
+def fingerprint_clarification_inputs(
+    issue: Issue, comments: tuple[Comment, ...]
+) -> str:
+    """Fingerprint issue/comment content that can answer clarification questions."""
+
+    input_parts: list[str] = [
+        issue.id,
+        issue.identifier,
+        issue.title,
+        issue.description or "",
+        issue.updated_at.isoformat() if issue.updated_at is not None else "",
+    ]
+    for comment in comments:
+        if is_clarification_comment(comment):
+            continue
+        input_parts.extend(
+            [
+                comment.id,
+                comment.body,
+                comment.created_at.isoformat()
+                if comment.created_at is not None
+                else "",
+                comment.updated_at.isoformat()
+                if comment.updated_at is not None
+                else "",
+            ]
+        )
+    return sha256("\0".join(input_parts).encode("utf-8")).hexdigest()
 
 
 def fingerprint_questions(questions: tuple[str, ...]) -> str:
@@ -253,6 +284,7 @@ __all__ = [
     "ClarificationWaitEntry",
     "CodexClarificationGate",
     "NoopClarificationGate",
+    "fingerprint_clarification_inputs",
     "fingerprint_questions",
     "format_clarification_comment",
     "is_clarification_comment",
