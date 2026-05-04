@@ -44,6 +44,15 @@ from typing import Any, Protocol
 from river_gang.codex.client import RuntimeEvent, Session
 from river_gang.config import EffectiveConfig
 from river_gang.observability.logging import set_log_context
+from river_gang.orchestrator.clarification import (
+    ClarificationGate,
+    ClarificationWaitEntry,
+    NoopClarificationGate,
+    fingerprint_questions,
+    format_clarification_comment,
+    next_clarification_poll_at,
+    non_clarification_comment_ids,
+)
 from river_gang.orchestrator.dispatch import (
     concurrency_check,
     dispatch_issue,
@@ -143,6 +152,8 @@ class _TrackerLike(Protocol):
 
     async def add_comment(self, issue_id: str, body: str) -> None: ...
 
+    async def fetch_comments(self, issue_id: str) -> list[Any]: ...
+
 
 class Orchestrator:
     """Main orchestrator class — owns mailbox, runs dispatcher, schedules ticks."""
@@ -160,6 +171,8 @@ class Orchestrator:
         config: EffectiveConfig,
         workflow_loader: WorkflowLoader,
         codex_client_factory: CodexClientPerWorkerFactory | None = None,
+        clarification_gate: ClarificationGate | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.state = state
         self.mailbox = mailbox
@@ -171,6 +184,8 @@ class Orchestrator:
         self.config = config
         self.workflow_loader = workflow_loader
         self._codex_client_factory = codex_client_factory
+        self.clarification_gate = clarification_gate or NoopClarificationGate()
+        self._clock = clock or (lambda: datetime.now(UTC))
 
         self._next_tick_handle: asyncio.TimerHandle | None = None
         self._cleanup_tasks: set[asyncio.Task[None]] = set()
@@ -250,6 +265,9 @@ class Orchestrator:
                 # check inside ``concurrency_check`` will short-circuit
                 # the rest naturally once total slots are exhausted.
                 continue
+            gate_allows_dispatch = await self._clarification_gate_allows_dispatch(issue)
+            if not gate_allows_dispatch:
+                continue
             dispatch_issue(
                 self.state,
                 issue=issue,
@@ -261,6 +279,80 @@ class Orchestrator:
 
         # 6. Reschedule next tick.
         self._schedule_next_tick()
+
+    async def _clarification_gate_allows_dispatch(self, issue: Issue) -> bool:
+        """Return True when pre-dispatch clarification allows implementation."""
+        now = self._clock()
+        waiting = self.state.clarification_waiting.get(issue.id)
+        if waiting is not None and now < waiting.next_poll_at:
+            return False
+
+        try:
+            comments = tuple(await self.tracker.fetch_comments(issue.id))
+        except Exception as exc:  # noqa: BLE001 -- gate must fail closed
+            logger.warning(
+                "clarification gate: fetch_comments failed for %s — skipping dispatch: %s",
+                issue.identifier,
+                exc,
+                exc_info=True,
+            )
+            return False
+
+        seen_comment_ids = non_clarification_comment_ids(comments)
+        if waiting is not None and seen_comment_ids <= waiting.last_seen_comment_ids:
+            self.state.clarification_waiting[issue.id] = ClarificationWaitEntry(
+                issue_id=waiting.issue_id,
+                identifier=waiting.identifier,
+                last_seen_comment_ids=waiting.last_seen_comment_ids,
+                last_question_fingerprint=waiting.last_question_fingerprint,
+                next_poll_at=next_clarification_poll_at(now),
+            )
+            return False
+
+        try:
+            ensure_result = await self.workspace_manager.ensure_for_issue(issue.identifier)
+            decision = await self.clarification_gate.analyze(
+                issue=issue,
+                comments=comments,
+                workspace_path=ensure_result.path,
+                config=self.config,
+            )
+        except Exception as exc:  # noqa: BLE001 -- model/codebase analysis must fail closed
+            logger.warning(
+                "clarification gate failed for %s — skipping dispatch: %s",
+                issue.identifier,
+                exc,
+                exc_info=True,
+            )
+            return False
+
+        if decision.sufficient:
+            self.state.clarification_waiting.pop(issue.id, None)
+            return True
+
+        question_fingerprint = fingerprint_questions(decision.questions)
+        if waiting is None or waiting.last_question_fingerprint != question_fingerprint:
+            try:
+                await self.tracker.add_comment(
+                    issue.id, format_clarification_comment(decision)
+                )
+            except Exception as exc:  # noqa: BLE001 -- fail closed and retry next tick
+                logger.warning(
+                    "clarification gate: add_comment failed for %s — skipping dispatch: %s",
+                    issue.identifier,
+                    exc,
+                    exc_info=True,
+                )
+                return False
+
+        self.state.clarification_waiting[issue.id] = ClarificationWaitEntry(
+            issue_id=issue.id,
+            identifier=issue.identifier,
+            last_seen_comment_ids=seen_comment_ids,
+            last_question_fingerprint=question_fingerprint,
+            next_poll_at=next_clarification_poll_at(now),
+        )
+        return False
 
     # ------------------------------------------------------------------
     # Reconcile (§8.5)

@@ -286,6 +286,12 @@ async def start_service(
     await watcher.last_known_good.set(config)
 
     # 8. Build orchestrator.
+    clarification_gate: Any | None = None
+    if per_worker_codex_factory is not None:
+        from river_gang.orchestrator.clarification import CodexClarificationGate
+
+        clarification_gate = CodexClarificationGate(per_worker_codex_factory)
+
     orchestrator = Orchestrator(
         state=state,
         mailbox=mailbox,
@@ -297,6 +303,7 @@ async def start_service(
         config=config,
         workflow_loader=lambda: _sync_holder_get(watcher.last_known_good),
         codex_client_factory=per_worker_codex_factory,
+        clarification_gate=clarification_gate,
     )
 
     # 9. Optional HTTP app (§13.7).
