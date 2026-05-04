@@ -22,8 +22,9 @@ No retry policy here; the orchestrator owns retry/backoff (§11.4).
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import Any, Protocol
 
+from river_gang.tracker.comment import Comment, parse_comment
 from river_gang.tracker.errors import (
     LinearMissingEndCursor,
     LinearStateNotFound,
@@ -31,11 +32,12 @@ from river_gang.tracker.errors import (
     MissingTrackerProjectSlug,
 )
 from river_gang.tracker.issue import Issue, parse_issue
-from river_gang.tracker.linear_transport import LinearTransport
 from river_gang.tracker.queries import (
     CANDIDATES_PAGE_SIZE,
     CANDIDATES_QUERY,
     COMMENT_CREATE_MUTATION,
+    COMMENTS_PAGE_SIZE,
+    ISSUE_COMMENTS_QUERY,
     ISSUE_UPDATE_STATE_MUTATION,
     STATE_REFRESH_PAGE_SIZE,
     STATE_REFRESH_QUERY,
@@ -45,18 +47,24 @@ from river_gang.tracker.queries import (
 )
 
 
+class _LinearTransportLike(Protocol):
+    async def execute(
+        self, query: str, variables: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+
 class LinearClient:
-    """Operations against a single Linear project.
+    """High-level Linear issue client.
 
     Args:
-        transport: configured :class:`LinearTransport`.
+        transport: configured GraphQL transport.
         project_slug: Linear project ``slugId`` (REQUIRED, non-empty).
     """
 
     def __init__(
         self,
         *,
-        transport: LinearTransport,
+        transport: _LinearTransportLike,
         project_slug: str,
     ) -> None:
         if not project_slug:
@@ -139,6 +147,34 @@ class LinearClient:
             },
             page_size=TERMINAL_FETCH_PAGE_SIZE,
         )
+
+    async def fetch_comments(self, issue_id: str) -> list[Comment]:
+        """Fetch all comments for ``issue_id`` in chronological API order."""
+
+        results: list[Comment] = []
+        cursor: str | None = None
+        while True:
+            data = await self._transport.execute(
+                ISSUE_COMMENTS_QUERY,
+                {"id": issue_id, "first": COMMENTS_PAGE_SIZE, "after": cursor},
+            )
+            issue = data.get("issue")
+            if not isinstance(issue, dict):
+                raise LinearUnknownPayload(
+                    "IssueComments response missing 'issue' object"
+                )
+            connection = _require_connection(issue, "comments")
+            for node in _require_nodes(connection):
+                results.append(parse_comment(node))
+            page_info = _require_page_info(connection)
+            if not bool(page_info.get("hasNextPage")):
+                return results
+            end_cursor = page_info.get("endCursor")
+            if not isinstance(end_cursor, str) or end_cursor == "":
+                raise LinearMissingEndCursor(
+                    "Linear returned comments.hasNextPage=true with missing/empty endCursor"
+                )
+            cursor = end_cursor
 
     # ------------------------------------------------------------------
     # Mutations

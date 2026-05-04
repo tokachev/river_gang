@@ -17,6 +17,7 @@ from __future__ import annotations
 CANDIDATES_PAGE_SIZE: int = 50
 STATE_REFRESH_PAGE_SIZE: int = 50
 TERMINAL_FETCH_PAGE_SIZE: int = 50
+COMMENTS_PAGE_SIZE: int = 50
 
 CANDIDATES_QUERY: str = """
 query Candidates($projectSlug: String!, $activeStates: [String!]!, $first: Int!, $after: String) {
@@ -80,6 +81,31 @@ query StateRefresh($issueIds: [ID!]!, $first: Int!, $after: String) {
     pageInfo {
       hasNextPage
       endCursor
+    }
+  }
+}
+""".strip()
+
+
+ISSUE_COMMENTS_QUERY: str = """
+query IssueComments($id: String!, $first: Int!, $after: String) {
+  issue(id: $id) {
+    comments(first: $first, after: $after) {
+      nodes {
+        id
+        body
+        createdAt
+        updatedAt
+        user {
+          id
+          name
+          displayName
+        }
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
     }
   }
 }

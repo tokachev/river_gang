@@ -27,6 +27,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+from river_gang.tracker.comment import Comment
 from river_gang.tracker.errors import LinearError
 from river_gang.tracker.issue import Issue
 
@@ -38,9 +39,13 @@ class FakeTracker:
         *,
         state_refreshes: dict[str, str] | None = None,
         terminal_by_state: dict[str, list[Issue]] | None = None,
+        comments_by_issue: dict[str, list[Comment]] | None = None,
     ) -> None:
         self._candidates: list[Issue] = list(candidates)
         self._state_refreshes: dict[str, str] = dict(state_refreshes or {})
+        self._comments_by_issue: dict[str, list[Comment]] = {
+            k: list(v) for k, v in (comments_by_issue or {}).items()
+        }
         self._terminal_by_state: dict[str, list[Issue]] = {
             k: list(v) for k, v in (terminal_by_state or {}).items()
         }
@@ -53,6 +58,7 @@ class FakeTracker:
         self.comments: list[tuple[str, str]] = []
         self._next_candidates_error: LinearError | None = None
         self._next_state_refresh_error: LinearError | None = None
+        self._next_comments_error: LinearError | None = None
         self._next_terminal_error: LinearError | None = None
         self._next_transition_error: LinearError | None = None
         self._next_comment_error: LinearError | None = None
@@ -67,6 +73,9 @@ class FakeTracker:
     def set_state_refreshes(self, refreshes: dict[str, str]) -> None:
         self._state_refreshes = dict(refreshes)
 
+    def set_comments(self, issue_id: str, comments: list[Comment]) -> None:
+        self._comments_by_issue[issue_id] = list(comments)
+
     def set_terminal_by_state(
         self, terminal: dict[str, list[Issue]]
     ) -> None:
@@ -77,6 +86,9 @@ class FakeTracker:
 
     def fail_next_state_refreshes(self, error: LinearError) -> None:
         self._next_state_refresh_error = error
+
+    def fail_next_comments(self, error: LinearError) -> None:
+        self._next_comments_error = error
 
     def fail_next_terminal(self, error: LinearError) -> None:
         self._next_terminal_error = error
@@ -150,6 +162,14 @@ class FakeTracker:
             err = self._next_comment_error
             self._next_comment_error = None
             raise err
+
+    async def fetch_comments(self, issue_id: str) -> list[Comment]:
+        self.calls.append(("fetch_comments", {"issue_id": issue_id}))
+        if self._next_comments_error is not None:
+            err = self._next_comments_error
+            self._next_comments_error = None
+            raise err
+        return list(self._comments_by_issue.get(issue_id, ()))
 
     async def fetch_issues_by_states(
         self, state_names: list[str]

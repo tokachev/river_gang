@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from river_gang.codex import RateLimitSnapshot, RuntimeEvent, TokenSnapshot
+from river_gang.orchestrator.clarification import ClarificationWaitEntry
 from river_gang.tracker.issue import Issue
 
 _ZERO_TOKENS = TokenSnapshot(input_tokens=0, output_tokens=0, total_tokens=0)
@@ -63,6 +64,9 @@ class OrchestratorState:
     # while the issue is in retry / completed (RetryEntry only carries
     # ``issue_id`` and ``completed`` is just a set of ids).
     identifier_index: dict[str, str] = field(default_factory=dict)
+    clarification_waiting: dict[str, ClarificationWaitEntry] = field(
+        default_factory=dict
+    )
 
     # ------------------------------------------------------------------
     # Claim set
@@ -119,6 +123,7 @@ class OrchestratorState:
 
 
 __all__: list[str] = [
+    "ClarificationWaitEntry",
     "OrchestratorState",
     "RunningEntry",
 ]
