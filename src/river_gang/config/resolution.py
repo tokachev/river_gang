@@ -101,6 +101,8 @@ def resolve_and_validate(
 
     workspace = WorkspaceConfig(
         root=normalize_path(base_cfg.workspace.root, base_dir=workflow_dir),
+        # Git remotes/URLs are identifiers, not filesystem paths; pass through.
+        repository=base_cfg.workspace.repository,
     )
 
     # ``codex.command`` is an arbitrary shell command, NOT a path — pass through.

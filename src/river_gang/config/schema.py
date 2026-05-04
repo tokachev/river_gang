@@ -30,6 +30,7 @@ class PollingConfig:
 @dataclass(frozen=True)
 class WorkspaceConfig:
     root: str
+    repository: str | None = None
 
 
 @dataclass(frozen=True)

@@ -36,8 +36,13 @@ The console script `river-gang` is installed as a project entry point;
    cp WORKFLOW.md.sample WORKFLOW.md
    ```
 
-3. Edit `tracker.project_slug` to your Linear project slug. Other
-   fields have working defaults; tweak them as needed.
+3. Edit `tracker.project_slug` to your Linear project slug. Set
+   `workspace.repository` to the Git repository that Linear tasks should
+   be executed in; each issue workspace will be cloned from this
+   repository and pull requests should be opened against the same repo.
+   Other fields have working defaults; tweak them as needed. `WORKFLOW.md`
+   is intentionally git-ignored because it is local operator config and
+   may contain project-specific repository URLs or secrets.
 
 The sample's prompt template uses Liquid syntax with the published
 `issue` + `attempt` variables. See `WORKFLOW.md.sample` for the full

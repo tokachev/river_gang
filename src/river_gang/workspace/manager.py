@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import shutil
+import subprocess
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +35,7 @@ logger = logging.getLogger(__name__)
 
 
 HookRunner = Callable[..., Awaitable[HookResult]]
+RepositoryPopulator = Callable[[str, Path], Awaitable[None]]
 
 
 class WorkspaceManagerError(Exception):
@@ -60,6 +62,10 @@ class WorkspaceHookFailed(WorkspaceManagerError):  # noqa: N818 -- spec-defined
         self.result = result
 
 
+class WorkspaceRepositoryFailed(WorkspaceManagerError):  # noqa: N818
+    """Repository population failed for a newly-created workspace."""
+
+
 @dataclass(frozen=True)
 class EnsureResult:
     """Outcome of :meth:`WorkspaceManager.ensure_for_issue`."""
@@ -74,9 +80,13 @@ class WorkspaceManager:
         *,
         config: EffectiveConfig,
         hook_runner: HookRunner | None = None,
+        repository_populator: RepositoryPopulator | None = None,
     ) -> None:
         self._config = config
         self._hook_runner: HookRunner = hook_runner or run_hook
+        self._repository_populator: RepositoryPopulator = (
+            repository_populator or populate_repository
+        )
         # One lock per identifier so different issues run in parallel; the
         # outer lock just guards lazy creation of the inner locks.
         self._locks_lock = asyncio.Lock()
@@ -123,11 +133,11 @@ class WorkspaceManager:
                     )
                 return EnsureResult(path=path, created_now=False)
 
-            # New workspace: ensure root exists, then mkdir the leaf, then
-            # run after_create. Failure unwinds the leaf dir.
+            # New workspace: ensure root exists, then create/populate the leaf,
+            # then run after_create. Failure unwinds the leaf dir.
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.mkdir()
             try:
+                await self._populate_workspace(path)
                 await self._maybe_run_after_create(path)
             except Exception:
                 # Implementation-Defined choice #1: remove partially-prepared
@@ -177,6 +187,18 @@ class WorkspaceManager:
         if not result.ok:
             raise WorkspaceHookFailed(script_name="after_create", result=result)
 
+    async def _populate_workspace(self, path: Path) -> None:
+        repository = self._config.workspace.repository
+        if repository is None or repository.strip() == "":
+            path.mkdir()
+            return
+        try:
+            await self._repository_populator(repository, path)
+        except Exception as exc:  # noqa: BLE001 -- add workspace-specific context
+            raise WorkspaceRepositoryFailed(
+                f"failed to populate workspace from repository {repository!r}: {exc}"
+            ) from exc
+
     async def _maybe_run_before_remove(self, path: Path) -> None:
         script = self._config.hooks.before_remove
         if script is None or script.strip() == "":
@@ -195,3 +217,30 @@ class WorkspaceManager:
                 result.timed_out,
                 result.duration_ms,
             )
+
+
+async def populate_repository(repository: str, destination: Path) -> None:
+    """Clone ``repository`` into ``destination``.
+
+    ``destination`` must not already exist. ``git clone`` creates it, keeping
+    the agent cwd rooted at the repository checkout itself.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        "git",
+        "clone",
+        repository,
+        str(destination),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        returncode = proc.returncode
+        assert returncode is not None
+        detail = (stderr or stdout).decode("utf-8", errors="replace").strip()
+        raise subprocess.CalledProcessError(
+            returncode,
+            ["git", "clone", repository, str(destination)],
+            output=stdout,
+            stderr=detail,
+        )

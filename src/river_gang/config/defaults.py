@@ -215,7 +215,10 @@ def _build_workspace(raw: dict[str, Any]) -> WorkspaceConfig:
     section = _require_map(raw.get("workspace"), path="workspace")
     root_value = section.get("root", _default_workspace_root())
     root = _coerce_required_str(root_value, path="workspace.root")
-    return WorkspaceConfig(root=root)
+    repository = _coerce_optional_str(
+        section.get("repository"), path="workspace.repository"
+    )
+    return WorkspaceConfig(root=root, repository=repository)
 
 
 def _build_hooks(raw: dict[str, Any]) -> HooksConfig:
