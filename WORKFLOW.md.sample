@@ -15,6 +15,9 @@ polling:
   interval_ms: 30000
 workspace:
   root: ~/river-gang-workspaces
+  # Optional: clone this repository into each issue workspace. Keep this
+  # value in your local WORKFLOW.md; WORKFLOW.md itself is git-ignored.
+  repository: https://github.com/your-org/your-repo.git
 agent:
   max_concurrent_agents: 2
   max_turns: 20
@@ -46,5 +49,7 @@ Labels: {% for label in issue.labels %}{{ label }} {% endfor %}
 {% if attempt > 1 %}
 This is attempt {{ attempt }}. Review prior progress in the workspace and continue.
 {% endif %}
+
+Use the repository already checked out in this workspace. Create a branch for the Linear issue, commit your changes there, and open a pull request against the same repository. Do not push directly to the default branch.
 
 Use the linear_graphql tool to update the issue when work completes.

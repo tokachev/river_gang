@@ -37,6 +37,7 @@ def test_apply_defaults_empty_dict_returns_full_defaults() -> None:
 
     # workspace default — raw string, NOT yet absolutized (Task 5 owns that)
     assert cfg.workspace.root == str(Path(tempfile.gettempdir()) / "symphony_workspaces")
+    assert cfg.workspace.repository is None
 
     # hooks defaults
     assert cfg.hooks.after_create is None
@@ -83,7 +84,10 @@ def test_apply_defaults_overrides_take_effect() -> None:
             "terminal_states": ["Done"],
         },
         "polling": {"interval_ms": 5000},
-        "workspace": {"root": "~/ws"},
+        "workspace": {
+            "root": "~/ws",
+            "repository": "https://github.com/tokachev/river_gang.git",
+        },
         "hooks": {
             "after_create": "echo create",
             "before_run": "echo before",
@@ -117,6 +121,7 @@ def test_apply_defaults_overrides_take_effect() -> None:
     assert cfg.tracker.terminal_states == ("Done",)
     assert cfg.polling.interval_ms == 5000
     assert cfg.workspace.root == "~/ws"
+    assert cfg.workspace.repository == "https://github.com/tokachev/river_gang.git"
     assert cfg.hooks.after_create == "echo create"
     assert cfg.hooks.timeout_ms == 1234
     assert cfg.agent.max_concurrent_agents == 3
