@@ -230,6 +230,16 @@ def test_string_false_decision_payload_fails_closed() -> None:
     assert decision.sufficient is False
 
 
+def test_malformed_fallback_json_payload_fails_closed() -> None:
+    decision = parse_clarification_decision_payload(
+        {"message": 'prefix {"sufficient": true, "questions": [} suffix'}
+    )
+
+    assert decision.sufficient is False
+    assert decision.rationale == "malformed model JSON"
+    assert decision.questions
+
+
 async def test_edited_comment_after_wait_reanalyzes_and_dispatches(
     tmp_path: Path,
 ) -> None:

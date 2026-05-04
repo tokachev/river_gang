@@ -171,15 +171,11 @@ def parse_clarification_decision_payload(payload: dict[str, Any]) -> Clarificati
     except json.JSONDecodeError:
         match = re.search(r"\{.*\}", text, flags=re.DOTALL)
         if match is None:
-            return ClarificationDecision(
-                sufficient=False,
-                questions=(
-                    "The pre-implementation analysis returned malformed JSON. "
-                    "Please clarify the expected final result and edge cases.",
-                ),
-                rationale="malformed model JSON",
-            )
-        data = json.loads(match.group(0))
+            return _malformed_json_decision()
+        try:
+            data = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return _malformed_json_decision()
 
     sufficient = data.get("sufficient") is True if isinstance(data, dict) else False
     raw_questions = data.get("questions") if isinstance(data, dict) else None
@@ -191,6 +187,17 @@ def parse_clarification_decision_payload(payload: dict[str, Any]) -> Clarificati
         sufficient=sufficient,
         questions=questions,
         rationale=rationale if isinstance(rationale, str) else None,
+    )
+
+
+def _malformed_json_decision() -> ClarificationDecision:
+    return ClarificationDecision(
+        sufficient=False,
+        questions=(
+            "The pre-implementation analysis returned malformed JSON. "
+            "Please clarify the expected final result and edge cases.",
+        ),
+        rationale="malformed model JSON",
     )
 
 
